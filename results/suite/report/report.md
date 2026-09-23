@@ -4,19 +4,19 @@ Model: 47.2M-param GPT (d 512, 8 layers, 8 heads, SwiGLU 1408, tied embeddings, 
 
 Primary metric: final **eval_indist**: 512 held-out 1024-token windows from the training distribution. Secondary: **eval_mix**: 512 rows of a fixed eval set drawn from the full, broader Dolma mixture. Lower is better; Δ values are paired by seed.
 
-Finished runs: stage 1 (LR sweep) 15, stage 2 (ablations) 10, stage 3 (seeds) 6, stage 4 (frontier) 0.
+Finished runs: stage 1 (LR sweep) 15, stage 2 (ablations) 10, stage 3 (seeds) 10, stage 4 (frontier) 16.
 
 ## 1. Headline: best config per optimizer at 131M tokens (2.8 tok/param)
 
 | optimizer | peak LR | seeds | eval_indist mean ± sd | Δ vs Muon (paired) | Δ vs AdamW (paired) | eval_mix | token multiplier vs Muon | optimizer time | tokens/s |
 |---|---|---|---|---|---|---|---|---|---|
-| LH-Muon | 0.002 | 2 | 3.6957 ± 0.0079 | +0.1038 ± 0.0045 | -0.0109 ± 0.0045 | 4.0402 | needs stage 4 | 7.8% | 61,195 |
-| LH-Muon, α = 0.25 | 0.002 | 2 | 3.6098 ± 0.0020 | +0.0179 ± 0.0024 | -0.0968 ± 0.0025 | 3.9015 | needs stage 4 | 8.7% | 72,449 |
-| Muon | 0.008 | 2 | 3.5919 ± 0.0015 | – | -0.1147 ± 0.0001 | 3.8420 | 1 (reference) | 8.4% | 72,906 |
-| AdamW | 0.002 | 3 | 3.7066 ± 0.0011 | +0.1147 ± 0.0001 | – | 4.0501 | needs stage 4 | 3.8% | 65,074 |
-| Lion | 0.00015 | 2 | 3.9314 ± 0.0058 | +0.3395 ± 0.0052 | +0.2248 ± 0.0052 | 4.4423 | needs stage 4 | 3.5% | 64,777 |
+| LH-Muon | 0.002 | 3 | 3.6982 ± 0.0070 | +0.1060 ± 0.0034 | -0.0084 ± 0.0036 | 4.0402 | 0.67× | 7.8% | 61,195 |
+| LH-Muon, α = 0.25 | 0.002 | 3 | 3.6094 ± 0.0015 | +0.0172 ± 0.0015 | -0.0972 ± 0.0015 | 3.9015 | 0.92× | 8.7% | 72,449 |
+| Muon | 0.008 | 3 | 3.5922 ± 0.0012 | – | -0.1144 ± 0.0003 | 3.8420 | 1 (reference) | 8.4% | 72,906 |
+| AdamW | 0.002 | 3 | 3.7066 ± 0.0011 | +0.1144 ± 0.0003 | – | 4.0501 | 0.65× | 3.8% | 65,074 |
+| Lion | 0.00015 | 3 | 3.9279 ± 0.0074 | +0.3356 ± 0.0049 | +0.2213 ± 0.0047 | 4.4423 | 0.36× | 3.5% | 64,777 |
 
-Seed noise: the SD of a paired difference between two optimizers is 0.0046 nats; a single run's SD across seeds is 0.0041. With 3 seeds, a paired Δ smaller than about 0.0053 nats (2 SE) is not distinguishable from noise.
+Seed noise: the SD of a paired difference between two optimizers is 0.0050 nats; a single run's SD across seeds is 0.0042. With 3 seeds, a paired Δ smaller than about 0.0057 nats (2 SE) is not distinguishable from noise.
 
 ![curves](fig1_curves.png)
 
@@ -55,11 +55,38 @@ These are single seeds. Read them against the seed-noise line in section 1.
 
 ## 4. Loss vs tokens and the token multiplier (fully decayed endpoints)
 
-Not run yet (stage 4).
+| optimizer | 32M | 65M | 131M | 262M | fit L = E + B·D^−β |
+|---|---|---|---|---|---|
+| LH-Muon | 4.2266 | 3.8318 | 3.6067 | 3.4417 | E 3.186, B 1.12e+05, β 0.669 |
+| Muon | 4.1163 | 3.7928 | 3.5916 | 3.4520 | E 3.203, B 4.4e+04, β 0.623 |
+| AdamW | 4.5027 | 3.9913 | 3.7135 | 3.5130 | E 3.235, B 3.45e+05, β 0.723 |
+| Lion | 5.2415 | 4.5664 | 3.9474 | 3.5788 | E 2.190, B 2.36e+03, β 0.384 |
+
+Token multiplier M = D_Muon(L) / D, at each budget of the other optimizers:
+
+| optimizer | 32M | 65M | 131M | 262M |
+|---|---|---|---|---|
+| LH-Muon | 0.83×* | 0.91× | 0.93× | 1.08×* |
+| AdamW | 0.57×* | 0.63× | 0.64× | 0.71× |
+| Lion | 0.28×* | 0.26×* | 0.35× | 0.52× |
+
+\* extrapolated beyond the baseline's measured token range.
+
+Token multiplier M = D_AdamW(L) / D, at each budget of the other optimizers:
+
+| optimizer | 32M | 65M | 131M | 262M |
+|---|---|---|---|---|
+| LH-Muon | 1.40× | 1.42× | 1.36× | 1.54×* |
+| Muon | 1.65× | 1.56× | 1.44× | 1.44×* |
+| Lion | 0.53×* | 0.47×* | 0.55× | 0.76× |
+
+\* extrapolated beyond the baseline's measured token range.
+
+![frontier](fig4_frontier.png)
 
 ## 5. Verdict
 
-LH-Muon (α = 0.25) − Muon at 131M tokens, paired over 2 seed(s): **+0.0179 ± 0.0024 nats** (more than 2 SE from zero).
+LH-Muon (α = 0.25) − Muon at 131M tokens, paired over 3 seed(s): **+0.0172 ± 0.0015 nats** (more than 2 SE from zero). That corresponds to a token multiplier of **0.92×** over Muon at 131M tokens.
 
 Pre-registered bar (from the design discussion): the gain counts if M ≥ 1.10× over tuned Muon, the 2σ band on Δ excludes zero, and the gain doesn't shrink with scale. That last check needs a second model size; this suite has one.
 

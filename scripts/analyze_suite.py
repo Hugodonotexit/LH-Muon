@@ -161,8 +161,8 @@ def fig_curves(runs, best_name, variant=None):
     legend_below(a1, min(3, len(have) + (1 if vname else 0)))
     if "muon" in have:
         a2.axhline(0, color=INK2, linewidth=1)
-        a2.annotate("Muon", (0.995, 0), xycoords=("axes fraction", "data"), xytext=(0, 4), textcoords="offset points",
-                    ha="right", fontsize=9, color=INK2)
+        a2.annotate("Muon", (0.01, 0), xycoords=("axes fraction", "data"), xytext=(0, -11), textcoords="offset points",
+                    ha="left", fontsize=9, color=INK2)
         ends = []
         series = [(o, seed_pairs(best_name, o), LABEL[o], "-") for o in have if o != "muon"]
         if vname and ok(runs.get(vname)):
@@ -291,12 +291,11 @@ def frontier_points(runs, o):
     return sorted(pts)
 
 
-def fig_frontier(runs, fits, variant=None):
+def fig_frontier(runs, fits, variant=None, noise=None):
     have = [o for o in ORDER if len(frontier_points(runs, o)) >= 2]
     if not have:
         return
-    fig, ax = plt.subplots(figsize=(7.5, 4.6))
-    ends = []
+    fig, (ax, a2) = plt.subplots(1, 2, figsize=(12.5, 4.6), gridspec_kw={"width_ratios": [1.15, 1]})
     for o in have:
         D, L = zip(*frontier_points(runs, o))
         lab = f"LH-Muon, {ABL_LABEL[variant]}" if (o == "lhmuon" and variant) else LABEL[o]
@@ -305,17 +304,44 @@ def fig_frontier(runs, fits, variant=None):
             E, B, beta = fits[o]
             xs = np.geomspace(min(D) * 0.9, max(D) * 1.1, 100)
             ax.plot(xs / 1e6, E + B * xs ** -beta, color=COLOR[o], linewidth=1.4)
-        ends.append((D[-1] / 1e6 * 1.04, L[-1], lab))
-    ax.set_xscale("log")
-    plain_log_axis(ax, sorted({p[0] / 1e6 for o in have for p in frontier_points(runs, o)}))
-    ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:.0f}"))
-    x0, x1 = ax.get_xlim()
-    ax.set_xlim(x0, x1 * 1.25)
-    label_ends(ax, ends)
-    ax.set_title("Loss vs tokens: decayed WSD endpoints, fit L = E + B·D^−β")
-    ax.set_xlabel("training tokens (M, log scale)")
+    ticks = sorted({p[0] / 1e6 for o in have for p in frontier_points(runs, o)})
+    for a in (ax, a2):
+        a.set_xscale("log")
+        plain_log_axis(a, ticks)
+        a.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:.0f}"))
+        a.set_xlabel("training tokens (M, log scale)")
+    ax.set_title("Loss vs tokens: decayed endpoints + fit L = E + B·D^−β")
     ax.set_ylabel("final eval loss, training distribution (nats)")
-    ax.legend()
+    ax.legend(loc="upper right")
+
+    # right: each optimizer minus Muon at every budget (the gap the left panel hides)
+    mu = dict(frontier_points(runs, "muon"))
+    if noise:
+        a2.axhspan(-2 * noise, 2 * noise, color=GRID, alpha=0.7, linewidth=0)
+    a2.axhline(0, color=COLOR["muon"], linewidth=1.5)
+    a2.annotate("Muon", (0.01, 0), xycoords=("axes fraction", "data"), xytext=(0, -11), textcoords="offset points",
+                fontsize=9, color=INK2)
+    for o in ("lhmuon", "adamw"):
+        pts = [(d, l - mu[d]) for d, l in frontier_points(runs, o) if d in mu]
+        if not pts:
+            continue
+        x, y = zip(*pts)
+        lab = f"LH-Muon, {ABL_LABEL[variant]}" if (o == "lhmuon" and variant) else LABEL[o]
+        a2.plot(np.array(x) / 1e6, y, "-" + MARK[o], color=COLOR[o], label=lab, markeredgecolor=SURFACE,
+                markeredgewidth=1.5)
+        for xi, yi in pts:
+            a2.annotate(f"{yi:+.3f}", (xi / 1e6, yi), xytext=(0, 8), textcoords="offset points", ha="center",
+                        fontsize=8.5, color=INK)
+    a2.set_title("Difference from Muon at each budget (below 0 = better)")
+    a2.set_ylabel("Δ final eval loss vs Muon (nats)")
+    lo, hi = a2.get_ylim()
+    a2.set_ylim(lo - 0.02, hi + 0.03)
+    x0, x1 = a2.get_xlim()
+    a2.set_xlim(x0 / 1.12, x1 * 1.12)
+    a2.legend(loc="upper right")
+    if noise:
+        a2.annotate("±2σ seed noise", (0.01, 2 * noise), xycoords=("axes fraction", "data"), xytext=(0, 3),
+                    textcoords="offset points", ha="left", fontsize=8, color=INK2)
     fig.tight_layout()
     fig.savefig(os.path.join(REPORT, "fig4_frontier.png"))
     plt.close(fig)
@@ -386,7 +412,7 @@ def main():
     fig_curves(runs, best_name, variant)
     fig_lr(runs, sweep)
     fig_ablations(runs, best_name, noise)
-    fig_frontier(runs, fits, variant)
+    fig_frontier(runs, fits, variant, noise)
 
     any_run = next(iter(runs.values()), None)
     L = []

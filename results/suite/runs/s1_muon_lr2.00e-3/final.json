@@ -43,6 +43,7 @@
   "eval_every": 100,
   "save_at": "",
   "init_from": "",
-  "seed": 0
+  "seed": 0,
+  "device": null
  }
 }

@@ -6,13 +6,14 @@ packaged with a memory-lean state container (block-scaled int8/int4 optimizer st
 offload) and fp16-safe updates. It is a drop-in `torch.optim.Optimizer`, and it also includes
 AdamW, Lion and factored-Adam update rules, so every baseline runs through the same code path.
 
-> **Result: in the regime tested, LH-Muon does not beat Muon.** On a 47M-parameter GPT trained on
-> 131M tokens, every slow-momentum setting was worse than plain Muon. The loss got steadily worse
-> as the slow term's weight α grew. The best variant (α = 0.25) is **+0.018 ± 0.002 nats** worse
-> than Muon, paired over 2 seeds, where seed noise is ≈ 0.005. The default (α = 2) is +0.104
-> worse. Details and all numbers are [below](#results). The repository is published as a
-> documented negative result plus reusable infrastructure: the quantized/offloaded state, fp16
-> stochastic-rounding updates, soft polar map, and a paired-seed optimizer benchmark harness.
+> **Result: mostly negative, with one open lead.** On a 47M-parameter GPT, every slow-momentum
+> setting is worse than plain Muon at 131M tokens. The best variant (α = 0.25) is
+> **+0.017 ± 0.002 nats** worse, paired over 3 seeds, against a noise level of ≈ 0.005. The
+> default (α = 2) is +0.106 worse. But LH-Muon's deficit **shrinks steadily with training
+> length** and flips sign at the longest budget tested: +0.110 → +0.039 → +0.015 → **−0.010** at
+> 33M → 66M → 131M → 262M tokens. That last point is single-seed and only about 2σ, so it is a
+> lead, not a result. LH-Muon costs about +1 byte/parameter of optimizer memory and ≈ 0.5% of
+> training time over Muon. Full numbers are [below](#results).
 
 ## Contents
 
@@ -48,25 +49,81 @@ results/suite/              the published run: report, figures, per-run logs and
   - Every number is a fully decayed endpoint.
 - **Hardware:** V100s.
 
-**Headline**: best LR per optimizer, 131M tokens (2.8 tokens/param):
+The benchmark ran in four stages (`scripts/run_suite.py`): an LR sweep, LH-Muon ablations, 3 seeds
+per optimizer at its best setting, and a loss-vs-tokens frontier. That is 51 runs in total; every
+run's log and final eval are in [`results/suite/runs`](results/suite/runs), and the generated report
+is [`results/suite/report/report.md`](results/suite/report/report.md).
 
-| optimizer | peak LR | seeds | loss (mean ± sd) | Δ vs Muon (paired) | Δ vs AdamW (paired) |
+### Headline: best setting per optimizer, 131M tokens (2.8 tokens/param), 3 seeds
+
+| optimizer | peak LR | loss (mean ± sd) | Δ vs Muon (paired) | Δ vs AdamW (paired) | tokens vs Muon for same loss |
 |---|---|---|---|---|---|
-| **Muon** | 8e-3 | 2 | **3.592 ± 0.002** | – | −0.115 ± 0.000 |
-| LH-Muon, α = 0.25 | 2e-3 | 2 | 3.610 ± 0.002 | +0.018 ± 0.002 | −0.097 ± 0.003 |
-| LH-Muon, α = 2 (default) | 2e-3 | 2 | 3.696 ± 0.008 | +0.104 ± 0.005 | −0.011 ± 0.005 |
-| AdamW | 2e-3 | 3 | 3.707 ± 0.001 | +0.115 ± 0.000 | – |
-| Lion | 1.5e-4 | 2 | 3.931 ± 0.006 | +0.340 ± 0.005 | +0.225 ± 0.005 |
+| **Muon** | 8e-3 | **3.592 ± 0.001** | – | −0.114 ± 0.000 | 1× |
+| LH-Muon, α = 0.25 | 2e-3 | 3.609 ± 0.002 | +0.017 ± 0.002 | −0.097 ± 0.002 | 0.92× |
+| LH-Muon, α = 2 (default) | 2e-3 | 3.698 ± 0.007 | +0.106 ± 0.003 | −0.008 ± 0.004 | 0.67× |
+| AdamW | 2e-3 | 3.707 ± 0.001 | +0.114 ± 0.000 | – | 0.65× |
+| Lion | 1.5e-4 | 3.928 ± 0.007 | +0.336 ± 0.005 | +0.221 ± 0.005 | 0.36× |
+
+The last column is the token multiplier: the tokens Muon needs to reach that optimizer's loss,
+divided by the tokens that optimizer used. It comes from Muon's fitted loss-vs-tokens curve below;
+under 1 means that optimizer needs more tokens than Muon.
+
+Seed noise is small. The SD of a paired difference between two optimizers is 0.005 nats, so with 3
+seeds any difference beyond ≈ 0.006 is outside 2 SE.
 
 ![loss curves and difference from Muon](results/suite/report/fig1_curves.png)
 
-**LR sweep** (seed 0). Every optimum is bracketed; the harness extends a grid automatically when
-its best LR sits on an edge. Muon is flat from 2e-3 to 8e-3. LH-Muon at α = 2 is almost
-insensitive to LR (3.705 / 3.701 / 3.702 over 1e-3 to 4e-3).
+The dashed α = 0.25 curve on the right is *below* Muon for most of training and loses its lead
+only in the LR decay phase (the last 20%). Losses during the constant-LR phase aren't comparable
+across different LRs, though: Muon runs at 8e-3 and LH-Muon at 2e-3, and a higher LR typically
+sits higher before the decay and gains more during it. Only the decayed endpoints are fair
+comparisons.
+
+### Loss vs tokens (stage 4)
+
+Each optimizer at its best setting had one 262M-token run, with fully decayed branches at 33M, 66M
+and 131M tokens. That gives 4 decayed endpoints per optimizer (seed 0), fitted with
+L = E + B·D^−β.
+
+![loss vs tokens and the gap to Muon](results/suite/report/fig4_frontier.png)
+
+| optimizer | 33M | 66M | 131M | 262M |
+|---|---|---|---|---|
+| Muon | 4.116 | 3.793 | 3.592 | 3.452 |
+| LH-Muon, α = 0.25 | 4.227 | 3.832 | 3.607 | **3.442** |
+| AdamW | 4.503 | 3.991 | 3.714 | 3.513 |
+| Lion | 5.242 | 4.566 | 3.947 | 3.579 |
+| **LH-Muon − Muon** | +0.110 | +0.039 | +0.015 | **−0.010** |
+
+Token multipliers against the fitted Muon curve (> 1 = needs fewer tokens than Muon; * =
+extrapolated beyond Muon's measured range):
+
+| vs Muon | 33M | 66M | 131M | 262M |
+|---|---|---|---|---|
+| LH-Muon, α = 0.25 | 0.83×* | 0.91× | 0.93× | 1.08×* |
+| AdamW | 0.57×* | 0.63× | 0.64× | 0.71× |
+| Lion | 0.28×* | 0.26×* | 0.35× | 0.52× |
+
+- **Muon needs 1.44–1.65× fewer tokens than AdamW** across the budgets (fitted against AdamW's
+  curve). That is in line with published Muon results, which suggests the harness is sound.
+- **LH-Muon's gap to Muon closes monotonically** as training gets longer. This is the pattern a
+  slow momentum should show: its long horizon only pays off once runs are long compared with it.
+  The 262M crossover is a single seed at ≈ 2σ, so it needs seeds and a longer budget before it
+  counts.
+- **AdamW and Lion also close on Muon with more tokens.** Lion improves fastest: its loss curve has
+  the smallest fitted exponent, β = 0.38 against 0.62–0.72 for the others.
+
+### LR sweep (stage 1, seed 0)
+
+Every optimum is bracketed; the harness extends a grid automatically when its best LR sits on an
+edge. Muon is flat from 2e-3 to 8e-3. LH-Muon at α = 2 is almost insensitive to LR (3.705 / 3.701
+/ 3.702 over 1e-3 to 4e-3).
 
 ![LR sweep](results/suite/report/fig2_lr_sweep.png)
 
-**Ablations** (seed 0, LH-Muon at LR 2e-3; Muon at the same LR scores 3.596):
+### Ablations (stage 2, seed 0)
+
+All at LH-Muon's LR of 2e-3; Muon at the same LR scores 3.596.
 
 | variant | loss | Δ vs Muon (same LR) |
 |---|---|---|
@@ -85,30 +142,51 @@ insensitive to LR (3.705 / 3.701 / 3.702 over 1e-3 to 4e-3).
 ![ablations](results/suite/report/fig3_ablations.png)
 
 **Reading it:**
-- **The slow momentum hurts in proportion to its weight**, and a fresher (shorter-horizon) slow
-  buffer hurts less. The orthogonalization gives a stale direction a full-magnitude step. In
-  AdEMAMix, Adam's normalization tames that term; here nothing does.
-- **The damage is done mostly during the LR decay phase.** At α = 2, LH-Muon was within 0.02 of
-  Muon at ~105M tokens and lost ~0.09 over the last 20% of training. Scaling α down together with
-  the LR did not recover that loss.
-- **The soft ε floor** changed the loss by −0.010 against LH-Muon's own default. That is within
-  about 2σ of seed noise.
+- **At 131M tokens the slow momentum hurts in proportion to its weight**, and a fresher
+  (shorter-horizon) slow buffer hurts less. The orthogonalization gives a stale direction a
+  full-magnitude step. In AdEMAMix, Adam's normalization tames that term; here nothing does.
+- **Scaling α down with the LR during the decay did not help.**
+- **The soft ε floor** changed the loss by −0.010 against LH-Muon's own default, within ~2σ of
+  seed noise.
 - **int4 optimizer state is not usable** in this setting (+0.18 vs int8). int8 is fine; the
   default runs use it.
 - **The sphere constraint caps capacity** when matrices need to grow. It also stalls a 2-layer MLP
   without norm layers at loss 0.25, where weight decay reaches 0.001.
-- **Muon beats AdamW by 0.115 nats**, which confirms the baseline harness behaves as expected.
 - **Lion is probably under-tuned.** Only its LR was swept; weight decay 0.7 and betas
   (0.9, 0.99) were fixed, and the 65k-token batch is small for sign updates.
 
-**Limits of this evidence:**
+### Resource cost: LH-Muon vs Muon
+
+LH-Muon adds one buffer, the slow momentum, per hidden weight matrix. It runs the same single
+Newton–Schulz orthogonalization per step as Muon, so compute barely changes.
+
+| | Muon | LH-Muon |
+|---|---|---|
+| optimizer state per matrix parameter (int8) | 1.0 B | 2.0 B |
+| optimizer state on GPU, 964M-param model | 0.92 GiB | 1.75 GiB |
+| … with the slow buffer's fp32 master in CPU RAM and an int4 copy on GPU | – | 1.38 GiB + 3.3 GiB pinned CPU RAM |
+| … with all state offloaded (`offload=True`) | – | 0.01 GiB + 5.0 GiB pinned CPU RAM |
+| optimizer step, 964M-param model, V100 (controlled benchmark) | 3.59 s | 3.83 s (+7%) |
+| extra cost of a slow-buffer refresh (every 20 steps) | – | +0.2 to +2 s, depending on placement |
+| optimizer time per step, 47M model (median over suite runs) | 0.079 s | 0.077–0.088 s |
+| end-to-end throughput, 47M model | ~70k tok/s | ~72k tok/s (same within noise) |
+| transient working memory during the step | 1.35 GiB | 1.35 GiB |
+| extra hyperparameters | – | α, slow horizon |
+
+- **Net cost:** the optimizer is 5–10% of a training step, so LH-Muon adds about **0.5% to total
+  training time**, plus ~1 byte per matrix parameter of memory.
+- **The biggest practical cost is tuning.** α alone moved the loss from +0.012 to +0.165 against
+  Muon.
+- **Low-precision caveat:** int4 for *both* buffers cost +0.18 nats; the host-master variant keeps
+  only an int4 *copy* of the slow buffer on the GPU, and its quality wasn't tested.
+
+### Limits of this evidence
+
 - One model size (47M).
-- Short budgets (2.8 tokens/param rather than ~20). Slow-momentum methods reportedly gain more
-  with longer horizons, and the horizon here was 300 steps.
-- Ablations are single-seed.
-- Seed stage partially complete at publication, and the loss-vs-tokens frontier stage
-  (token multipliers) was not run. Full per-run logs are in [`results/suite/runs`](results/suite/runs),
-  and the generated report is [`results/suite/report/report.md`](results/suite/report/report.md).
+- Moderate budgets: up to 5.6 tokens/param, not the ~20 typical of compute-optimal training.
+- The frontier and the ablations are single-seed; only the 131M headline has 3 seeds.
+- LH-Muon's slow horizon was fixed at 300 steps. The α = 0.25 variant was chosen on one seed and
+  then used for the seed and frontier stages, which biases slightly in LH-Muon's favour.
 
 ## Install
 
