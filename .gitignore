@@ -5,6 +5,6 @@ __pycache__/
 build/
 dist/
 # local training outputs and data (the published snapshot lives in results/)
-runs/
-data/
+/runs/
+/data/
 *.pt
