@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lhmuon"
+version = "0.1.0"
+description = "Muon with a long-horizon slow momentum, block-scaled int8/int4 state, CPU offload and fp16-safe updates"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = ["torch>=2.1", "numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest", "matplotlib"]
+
+[project.urls]
+Homepage = "https://github.com/Hugodonotexit/LH-Muon"
+
+[tool.setuptools]
+packages = ["lhmuon"]

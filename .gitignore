@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+# local training outputs and data (the published snapshot lives in results/)
+runs/
+data/
+*.pt

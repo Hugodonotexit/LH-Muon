@@ -1,0 +1,7 @@
+{
+ "variant": "alpha0.25",
+ "args": [
+  "--alpha",
+  "0.25"
+ ]
+}
