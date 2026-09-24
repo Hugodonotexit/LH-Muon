@@ -310,3 +310,14 @@ def test_lion_matches_reference():
         W = W * (1 - 1e-3 * 0.5) - 1e-3 * torch.sign(0.9 * m + 0.1 * g)
         m = 0.99 * m + 0.01 * g
     assert torch.allclose(p.data, W, atol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_newton_schulz_low_precision_tiny_inputs(dtype):
+    """Momenta can have entries ~1e-6; they must be normalized before the cast to fp16/bf16."""
+    torch.manual_seed(0)
+    C = torch.randn(512, 1536, device=DEV) * 1e-6
+    ref = newton_schulz(C.double(), dtype=torch.float64)
+    out = newton_schulz(C, dtype=dtype)
+    err = ((out.double() - ref).norm() / ref.norm()).item()
+    assert err < {torch.float16: 0.01, torch.bfloat16: 0.05}[dtype], err

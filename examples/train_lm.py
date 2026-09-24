@@ -170,6 +170,8 @@ def main():
     ap.add_argument("--slow-dtype", default="int8")
     ap.add_argument("--slow-master", default="device")
     ap.add_argument("--offload", action="store_true")
+    ap.add_argument("--ns-dtype", default="auto", choices=["auto", "fp32", "bf16", "fp16"],
+                    help="Newton-Schulz compute dtype (auto: bf16 on sm_80+, fp32 otherwise)")
     ap.add_argument("--categories", default="cc_en_head,c4,books,arxiv")
     ap.add_argument("--eval-rows", type=int, default=128)
     ap.add_argument("--final-eval-rows", type=int, default=512)
@@ -208,7 +210,8 @@ def main():
     opt = LHMuon(groups, lr=a.lr, total_steps=steps, slow_horizon=a.slow_horizon, alpha=a.alpha if a.opt == "lhmuon" else 0.0,
                  slow_every=a.slow_every, soft_kappa=a.soft_kappa if a.opt == "lhmuon" else 0.0,
                  combine=a.combine, norm_control=a.norm_control, state_dtype=a.state_dtype,
-                 slow_dtype=a.slow_dtype, slow_master=a.slow_master, offload=a.offload, seed=a.seed)
+                 slow_dtype=a.slow_dtype, slow_master=a.slow_master, offload=a.offload, seed=a.seed,
+                 ns_dtype=a.ns_dtype)
     scale = 2.0 ** 14 if dtype == torch.float16 else 1.0
     clean = 0
     start = 0

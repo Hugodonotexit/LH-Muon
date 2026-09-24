@@ -29,7 +29,7 @@ scripts/run_suite.py        the benchmark: LR sweep → ablations → seeds → 
 scripts/analyze_suite.py    tables + figures from a suite directory
 scripts/fit_multiplier.py   token multiplier from fully decayed endpoints (L = E + B·D^−β fit)
 scripts/bench_optimizers.py optimizer memory + step time for AdamW, Lion, Muon, LH-Muon
-tests/test_lhmuon.py        36 unit tests
+tests/test_lhmuon.py        38 unit tests
 results/suite/              the published run: report, figures, per-run logs and final evals
 ```
 
@@ -379,10 +379,23 @@ there are no fused kernels.
 | LH-Muon, `offload=True` | 3.96 s | 5.35 s | 0.01 GiB | 5.03 GiB |
 | LH-Muon, fp16 state + fp16 slow | 3.96 s | 4.02 s | 3.55 GiB | – |
 
-Most of that time is fp32 Newton–Schulz, since the V100 has no bf16. On a V100, fp16 NS on
-Frobenius-normalized input is ~5× faster (2048² in 3.8 ms vs 19.2 ms). It showed 0.6–0.9%
-relative error vs fp64 on synthetic spectra, but it hasn't been verified on real momenta, so
-`ns_dtype="auto"` keeps fp32 on pre-Ampere GPUs.
+Most of that time is fp32 Newton–Schulz, since the V100 has no bf16.
+
+**fp16 Newton–Schulz (`ns_dtype="fp16"`).** fp16 matmuls are ~2.2× faster on a V100 for a 117M
+model's matrices (135 → 60 ms for all 48) and ~5× for 2048² matrices. Checked against fp64 on
+the 64 real momentum matrices saved in the benchmark checkpoints:
+
+| Newton–Schulz variant | error vs fp64 (median / max) | worst cosine |
+|---|---|---|
+| fp32 | 1.4e-6 / 3.6e-6 | 1.00000 |
+| fp16, before the fix (cast to fp16, then normalize) | 1.5–4% / 24% | 0.971 |
+| fp16, current (normalize in fp32, then cast) | 0.25% / 0.53% | 0.99999 |
+
+Earlier versions cast the raw momentum to fp16 *before* normalizing it, and entries around 1e-6
+flushed to zero. That is fixed, and a regression test covers it. All published benchmark results
+used fp32 Newton–Schulz and are unaffected. An end-to-end training check of fp16 Newton–Schulz
+is in progress, so `ns_dtype="auto"` still keeps fp32 on pre-Ampere GPUs. The training script
+takes `--ns-dtype fp16`.
 
 ## Reproducing the benchmark
 
@@ -419,7 +432,7 @@ it recovers 1.32×.
 
 ## Tests
 
-`python -m pytest tests -q` runs 36 tests. They cover:
+`python -m pytest tests -q` runs 38 tests. They cover:
 - quantization error bounds, unbiased stochastic encoding (int8, int4) and weight rounding
   (fp16, bf16, including subnormals);
 - the soft-polar identity (SVD, fp64) and its per-direction shrinkage;
