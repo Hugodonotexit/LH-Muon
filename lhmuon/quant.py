@@ -50,9 +50,8 @@ def _pack4(u, rows):
 
 
 def _unpack4(q):
-    lo = (q & 0x0F).to(torch.int64)
-    hi = (q >> 4).to(torch.int64)
-    return torch.stack((lo, hi), dim=-1).view(q.shape[0], -1)
+    """two per byte -> uint8 codes 0..15 (uint8, not int64: this runs on every decode)."""
+    return torch.stack((q & 0x0F, q >> 4), dim=-1).view(q.shape[0], -1)
 
 
 def _rand(shape, like, generator):
@@ -132,9 +131,9 @@ def decode(q: torch.Tensor, s: torch.Tensor, fmt: str, shape) -> torch.Tensor:
     for d in shape:
         numel *= d
     if fmt in ("int4", "int4b16"):
-        y = (_unpack4(q) - 8).float() / QMAX[fmt]
+        y = (_unpack4(q).to(torch.int8) - 8).float() / QMAX[fmt]
     elif fmt == "nf4":
-        y = _nf4_levels(q.device)[_unpack4(q)]
+        y = _nf4_levels(q.device)[_unpack4(q).long()]
     elif fmt == "int8":
         y = q.float() / QMAX["int8"]
     else:

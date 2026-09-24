@@ -378,6 +378,13 @@ W  ← W(1 − lr·wd) − lr · 0.2·√max(m,n) · U   decoupled wd, RMS-match
   ones where the noise lives. Smaller blocks and non-linear levels reduce the damage but don't
   remove it. **The slow buffer can be 4-bit**, but only as a snapshot of an fp32 master in CPU RAM,
   refreshed every K steps, so the rounding error doesn't accumulate.
+
+  Cost of the CPU master on a 964M-parameter model (two GPU processes at once, on a host whose CPU
+  was heavily loaded): 0.37 GiB less GPU memory per process, 3.3 GiB of pinned CPU RAM per
+  process, and ~3.3 s extra on every K-th optimizer step (K = 9 at a 300-step horizon). Averaged
+  over a real training step of 35–60 s, that is ~1%. The refresh moves fp32 through pinned memory:
+  on that host, unpinned copies were ~20× slower and bf16 transfers lost to the CPU's slow
+  bf16↔fp32 conversion. Checkpoints include the fp32 master (+4 B per matrix parameter).
 - **Offload.** With `offload=True`, all quantized state lives in pinned host memory. The next
   tensor's state is prefetched on a side stream while the current one updates. Results are
   bit-identical to on-device (tested). Transfers are not overlapped with the backward pass.
