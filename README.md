@@ -12,8 +12,8 @@ AdamW, Lion and factored-Adam update rules, so every baseline runs through the s
 > of ≈ 0.005. But its deficit shrinks steadily with training length and then reverses:
 > +0.110 → +0.039 → +0.015 → −0.010 → **−0.028** at 33M → 66M → 131M → 262M → 524M tokens
 > (0.7–11 tokens/param). At 524M that is roughly **1.3× fewer tokens than Muon for the same loss**.
-> The long-budget points are single-seed and one model size, so this is a promising lead, not an
-> established result. LH-Muon costs about +1 byte/parameter of optimizer memory and ≈ 0.5% of
+> The long-budget points are single-seed and one model size, and no further seeds were run, so this
+> is a promising lead, not an established result (see [Limits](#limits-of-this-evidence)). LH-Muon costs about +1 byte/parameter of optimizer memory and ≈ 0.5% of
 > training time over Muon. Full numbers are [below](#results).
 
 ## Contents
@@ -230,13 +230,24 @@ transformer (880.8M params in 392 hidden matrices), one V100:
 
 ### Limits of this evidence
 
-- One model size (47M).
-- Moderate budgets: up to 11 tokens/param (Muon and LH-Muon) or 5.6 (AdamW, Lion), not the ~20
-  typical of compute-optimal training.
-- The frontier and the ablations are single-seed; only the 131M headline has 3 seeds. The
-  crossover in LH-Muon's favour happens only at the single-seed long budgets.
-- LH-Muon's slow horizon was fixed at 300 steps. The α = 0.25 variant was chosen on one seed and
-  then used for the seed and frontier stages, which biases slightly in LH-Muon's favour.
+This study is finished; no further runs are planned. Read the results with these limits in mind:
+
+- **The crossover is unconfirmed.** LH-Muon beats Muon only at 262M and 524M tokens, and those two
+  points are a single seed each (seed 0). Extra seeds at those budgets would take ~4 h on 2 V100s and
+  were not run. The gap narrows at every one of the five budgets, which makes chance less likely,
+  but a second seed could still shrink or remove the advantage.
+- **The 524M multiplier is extrapolated.** LH-Muon's 524M loss is below anything Muon reached, so
+  "≈ 1.3× fewer tokens" extends Muon's fitted curve beyond its data.
+- **One model size (47M).** A 117M-parameter comparison was started but
+  stopped before producing results, so nothing here shows how the effect scales with model size.
+- **Moderate budgets:** up to 11 tokens/param for Muon and LH-Muon and 5.6 for AdamW and Lion, short
+  of the ~20 typical of compute-optimal training. AdamW and Lion were not extended to 524M.
+- **Only the 131M headline has 3 seeds.** The frontier and the ablations are single-seed.
+- **LH-Muon had a mild selection advantage.** Its slow horizon was fixed at 300 steps, and the
+  α = 0.25 variant was picked on one seed and then reused for the seed and frontier stages.
+- **Lion is probably under-tuned.** Only its LR was swept.
+- **Resource timings are approximate.** The optimizer benchmark ran on a shared RTX 3060
+  (±10–15%); the share-of-training-time numbers come from V100 runs on a shared machine.
 
 ## Install
 
