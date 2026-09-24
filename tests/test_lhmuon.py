@@ -321,3 +321,54 @@ def test_newton_schulz_low_precision_tiny_inputs(dtype):
     out = newton_schulz(C, dtype=dtype)
     err = ((out.double() - ref).norm() / ref.norm()).item()
     assert err < {torch.float16: 0.01, torch.bfloat16: 0.05}[dtype], err
+
+
+CHUNK_CASES = {
+    "muon": dict(alpha=0.0),
+    "lhmuon": dict(alpha=0.5, slow_every=2),
+    "lhmuon host": dict(alpha=0.5, slow_every=2, slow_master="host"),
+    "separate": dict(alpha=0.5, slow_every=2, combine="separate"),
+    "soft": dict(alpha=0.5, slow_every=2, soft_kappa=1.0),
+    "sphere": dict(alpha=0.5, slow_every=2, norm_control="sphere"),
+}
+
+
+@pytest.mark.parametrize("case", list(CHUNK_CASES))
+def test_chunked_equals_unchunked(case):
+    """Many small chunks must give the same result as one chunk per tensor. fp32 weights and state
+    make the update deterministic (no stochastic rounding), so only summation order differs."""
+    kw = dict(lr=0.01, total_steps=100, slow_horizon=16, state_dtype="fp32", slow_dtype="fp32", ns_dtype="fp32",
+              **CHUNK_CASES[case])
+    a, b = Toy().to(DEV), Toy().to(DEV)
+    b.load_state_dict(a.state_dict())
+    oa = LHMuon(build_param_groups(a), chunk_elements=1 << 30, **kw)
+    ob = LHMuon(build_param_groups(b), chunk_elements=512, **kw)      # every tensor split into many chunks
+    g = torch.Generator(device=DEV).manual_seed(0)
+    for _ in range(7):
+        for pa, pb in zip(a.parameters(), b.parameters()):
+            grad = torch.randn(pa.shape, generator=g, device=DEV)
+            pa.grad, pb.grad = grad.clone(), grad.clone()
+        oa.step()
+        ob.step()
+    for (n, pa), pb in zip(a.named_parameters(), b.parameters()):
+        assert torch.allclose(pa, pb, atol=2e-5, rtol=1e-5), (n, (pa - pb).abs().max().item())
+
+
+@pytest.mark.parametrize("kind", ["adamw", "lion"])
+def test_chunked_elementwise_kinds(kind):
+    a, b = Toy().to(DEV), Toy().to(DEV)
+    b.load_state_dict(a.state_dict())
+    ga, gb = build_param_groups(a), build_param_groups(b)
+    for g in ga + gb:
+        g["kind"] = kind
+    oa = LHMuon(ga, lr=1e-3, alpha=0.0, chunk_elements=1 << 30)
+    ob = LHMuon(gb, lr=1e-3, alpha=0.0, chunk_elements=512)
+    gen = torch.Generator(device=DEV).manual_seed(0)
+    for _ in range(5):
+        for pa, pb in zip(a.parameters(), b.parameters()):
+            grad = torch.randn(pa.shape, generator=gen, device=DEV)
+            pa.grad, pb.grad = grad.clone(), grad.clone()
+        oa.step()
+        ob.step()
+    for (n, pa), pb in zip(a.named_parameters(), b.parameters()):
+        assert torch.allclose(pa, pb, atol=1e-6), n

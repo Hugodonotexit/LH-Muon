@@ -29,7 +29,7 @@ scripts/run_suite.py        the benchmark: LR sweep → ablations → seeds → 
 scripts/analyze_suite.py    tables + figures from a suite directory
 scripts/fit_multiplier.py   token multiplier from fully decayed endpoints (L = E + B·D^−β fit)
 scripts/bench_optimizers.py optimizer memory + step time for AdamW, Lion, Muon, LH-Muon
-tests/test_lhmuon.py        38 unit tests
+tests/test_lhmuon.py        46 unit tests
 results/suite/              the published run: report, figures, per-run logs and final evals
 ```
 
@@ -175,7 +175,7 @@ state, while Muon and LH-Muon keep int8.
 | state, 47M model | 360 MiB | 180 MiB | 46 MiB | 71 MiB |
 | state, 117M model | 894 MiB | 447 MiB | 114 MiB | 196 MiB |
 | state with 8-bit AdamW / Lion (e.g. bitsandbytes) | ~2 B/param | ~1 B/param | 1.02 B/param | 1.6–1.75 B/param |
-| temporary memory during the step, 117M model | 1.33 GiB | 1.21 GiB | 1.34 GiB | 1.33 GiB |
+| temporary memory during the step, 117M model | 156 MiB | 156 MiB | 199 MiB | 200 MiB |
 | optimizer step, 47M model | 80 ms | 65 ms | 159 ms | 168 ms |
 | optimizer step, 117M model | 131 ms | 101 ms | 266 ms | 299 ms |
 
@@ -349,6 +349,7 @@ W  ← W(1 − lr·wd) − lr · 0.2·√max(m,n) · U   decoupled wd, RMS-match
 | `slow_dtype` | `"int8"` | slow buffer on device, or its snapshot when `slow_master="host"` |
 | `slow_master` | `"device"` | `"host"`: fp32 slow EMA in pinned host RAM, device holds a round-to-nearest snapshot |
 | `offload` | False | all quantized state in pinned host RAM, streamed per tensor |
+| `chunk_elements` | 4,194,304 | element-wise work runs on chunks of this size; smaller = less temporary memory, more kernel launches |
 | `adam_betas`, `adam_eps`, `factored_clip` | (0.9, 0.95), 1e-8, 1.0 | factored + adamw kinds |
 
 ## State, precision and memory
@@ -360,14 +361,21 @@ W  ← W(1 − lr·wd) − lr · 0.2·√max(m,n) · U   decoupled wd, RMS-match
 - **Offload.** With `offload=True`, all quantized state lives in pinned host memory. The next
   tensor's state is prefetched on a side stream while the current one updates. Results are
   bit-identical to on-device (tested). Transfers are not overlapped with the backward pass.
+- **Chunked updates.** Every element-wise stage (gradient unscaling, momentum decode/update/encode,
+  weight decay, stochastic rounding into fp16) runs over chunks of `chunk_elements` elements
+  (default 4M), so its fp32 temporaries exist for one chunk at a time. Only Newton–Schulz sees a
+  whole matrix at once. On a 964M-parameter model this cut the optimizer's temporary memory from
+  1,377 MiB to 206 MiB at the same speed; `chunk_elements=1 << 20` gets to 77 MiB for ≈ 3% more
+  time, and the floor, set by Newton–Schulz on the largest matrix, is ≈ 76 MiB. Chunked and
+  unchunked updates agree to float rounding (tested for every update rule).
 - **Checkpointing.** `state_dict()` keeps the storage format. `load_state_dict()` allocates fresh
   buffers under the current settings, and it refuses a checkpoint saved with a different format
   rather than reinterpreting it. Resume is bit-exact (tested).
 
 **Optimizer step cost** on a 963.8M-parameter hybrid-attention transformer (880.8M params in 392
-spectral matrices): fp16 weights, one V100-SXM2-16GB, synthetic gradients, median step. The
-transient memory is ~1.35 GiB in every configuration, from the per-tensor fp32 working copies;
-there are no fused kernels.
+spectral matrices): fp16 weights, one V100-SXM2-16GB, synthetic gradients, median step. These
+timings predate chunked updates; the step times are unchanged by chunking, and the optimizer's
+temporary memory is now ~0.2 GiB instead of ~1.35 GiB.
 
 | configuration | step | refresh step | device state | host state |
 |---|---|---|---|---|
@@ -449,7 +457,7 @@ it recovers 1.32×.
 
 ## Tests
 
-`python -m pytest tests -q` runs 38 tests. They cover:
+`python -m pytest tests -q` runs 46 tests. They cover:
 - quantization error bounds, unbiased stochastic encoding (int8, int4) and weight rounding
   (fp16, bf16, including subnormals);
 - the soft-polar identity (SVD, fp64) and its per-direction shrinkage;
@@ -457,6 +465,8 @@ it recovers 1.32×.
 - loss-scale unscaling and skip-on-inf;
 - sphere radius and the zero-init fallback;
 - offload bit-identical to on-device;
+- chunked updates matching unchunked ones for every update rule (Muon, LH-Muon with device or
+  host slow buffer, `separate`, soft ε, sphere, factored Adam, AdamW, Lion);
 - bit-exact resume and refusal of mismatched checkpoints;
 - a toy regression that trains with every state format.
 

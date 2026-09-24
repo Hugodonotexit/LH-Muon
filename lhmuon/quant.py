@@ -110,3 +110,42 @@ def bytes_per_param(fmt: str) -> float:
         return 4.0
     payload = {"bf16": 2.0, "fp16": 2.0, "int8": 1.0, "int4": 0.5}[fmt]
     return payload + 4.0 / BLOCK[fmt]
+
+
+# ---------------------------------------------------------------------------
+# ranges of a flattened tensor, for chunked updates
+# ---------------------------------------------------------------------------
+# A chunk is the flat element range [start, start + n) of a tensor whose container was made by
+# encode(). For the block formats, `start` must be a multiple of the block size (every chunk but
+# the last is a whole number of blocks), so chunk k owns container rows [start/B, (start+n)/B) and
+# encoding chunk by chunk gives the same layout as encoding the whole tensor at once.
+
+def chunk_unit(fmt: str) -> int:
+    return BLOCK.get(fmt, 1)
+
+
+def decode_range(q: torch.Tensor, s: torch.Tensor, fmt: str, start: int, n: int) -> torch.Tensor:
+    """Elements [start, start + n) of the tensor that (q, s) encodes, as a flat fp32 tensor."""
+    if fmt == "fp32":
+        return q.reshape(-1)[start:start + n].float().clone()
+    B = BLOCK[fmt]
+    if start % B:
+        raise ValueError(f"chunk start {start} is not a multiple of the {fmt} block size {B}")
+    b0, b1 = start // B, -(-(start + n) // B)
+    return decode(q[b0:b1], s[b0:b1], fmt, (min(n, (b1 - b0) * B),))[:n]
+
+
+def encode_into(q: torch.Tensor, s: torch.Tensor, fmt: str, x: torch.Tensor, start: int,
+                generator: torch.Generator = None, stochastic: bool = True):
+    """Write the flat fp32 chunk `x` (elements [start, start + len(x)) of the tensor) into (q, s)."""
+    n = x.numel()
+    if fmt == "fp32":
+        q.reshape(-1)[start:start + n].copy_(x.reshape(-1))
+        return
+    B = BLOCK[fmt]
+    if start % B:
+        raise ValueError(f"chunk start {start} is not a multiple of the {fmt} block size {B}")
+    qc, sc = encode(x, fmt, generator, stochastic)
+    b0 = start // B
+    q[b0:b0 + qc.shape[0]].copy_(qc)
+    s[b0:b0 + sc.shape[0]].copy_(sc)

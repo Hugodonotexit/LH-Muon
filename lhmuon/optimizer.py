@@ -57,7 +57,8 @@ class LHMuon(torch.optim.Optimizer):
                  soft_kappa: float = 0.0, noise_beta: float = 0.99,
                  adam_betas=(0.9, 0.95), adam_eps: float = 1e-8, factored_clip: float = 1.0,
                  state_dtype: str = "int8", slow_dtype: str = "int8", slow_master: str = "device",
-                 offload: bool = False, stochastic_weights: bool = True, min_dim: int = 32, seed: int = 0):
+                 offload: bool = False, stochastic_weights: bool = True, min_dim: int = 32, seed: int = 0,
+                 chunk_elements: int = 1 << 22):
         if combine not in ("sum", "separate"):
             raise ValueError(f"combine must be 'sum' or 'separate', not {combine!r}")
         if norm_control not in ("sphere", "wd", "none"):
@@ -95,6 +96,7 @@ class LHMuon(torch.optim.Optimizer):
         self.offload = offload
         self.stochastic_weights = stochastic_weights
         self.min_dim = min_dim
+        self.chunk_elements = int(chunk_elements)   # element-wise work runs on chunks of this many elements
         self.seed = seed
         self.alpha_mult = 1.0      # a trainer may scale alpha per step, e.g. with the LR during the decay phase
         self._t = 0
@@ -243,66 +245,102 @@ class LHMuon(torch.optim.Optimizer):
             self._gens[key] = g
         return self._gens[key]
 
-    @staticmethod
-    def _grad(p, mshape, coef):
-        g = p.grad.detach().to(torch.float32, copy=True)
-        if coef != 1.0:
-            g.mul_(coef)
-        return g.reshape(mshape) if mshape is not None else g
+    # ------------------------------------------------------------------ chunking
+    # Every element-wise stage runs over flat chunks of about `chunk_elements` elements, so the
+    # fp32 temporaries of one step (gradient copy, decoded momentum, update, weight copy, the
+    # intermediates of stochastic rounding) exist for one chunk at a time instead of the whole
+    # tensor. Chunks are whole rows and whole state blocks, so row statistics and the block-scaled
+    # containers come out as if the tensor had been processed in one piece.
+
+    def _chunks(self, numel, row_len):
+        unit = math.lcm(max(1, row_len), 256)                   # 256 is a multiple of every block size
+        size = max(unit, (self.chunk_elements // unit) * unit)
+        for a in range(0, numel, size):
+            yield a, min(numel, a + size)
 
     @staticmethod
-    def _weights(p, mshape):
-        """fp32 view of the weights; in place for fp32 contiguous params, a copy otherwise."""
-        if p.dtype == torch.float32 and p.is_contiguous():
-            W = p.data if mshape is None else p.data.view(mshape)
-            return W, True
-        W = p.data.float()
-        return (W if mshape is None else W.reshape(mshape)), False
+    def _flat(p):
+        """(flat fp16/fp32 view of the weights, flat view of the gradient); both must be contiguous."""
+        if not p.data.is_contiguous():
+            p.data = p.data.contiguous()
+        g = p.grad if p.grad.is_contiguous() else p.grad.contiguous()
+        return p.data.view(-1), g.view(-1)
 
-    def _commit(self, p, W, inplace, gen):
-        if inplace:
-            return
-        if p.dtype in (torch.float16, torch.bfloat16) and self.stochastic_weights:
-            p.data.copy_(Q.stochastic_round(W, p.dtype, gen).view_as(p))
+    def _write(self, dst, W, gen):
+        """dst (a flat slice of the parameter) <- W (fp32), with stochastic rounding for fp16/bf16."""
+        if dst.dtype in (torch.float16, torch.bfloat16) and self.stochastic_weights:
+            dst.copy_(Q.stochastic_round(W, dst.dtype, gen))
         else:
-            p.data.copy_(W.view_as(p))
+            dst.copy_(W)
 
-    def _decode(self, bufs, name, shape):
-        return Q.decode(bufs[name + ".q"], bufs[name + ".s"], self._fmt(name), shape)
-
-    def _encode(self, new, name, x, gen, stochastic=True):
-        new[name + ".q"], new[name + ".s"] = Q.encode(x, self._fmt(name), gen, stochastic)
+    def _new_like(self, bufs, name):
+        return torch.empty_like(bufs[name + ".q"]), torch.empty_like(bufs[name + ".s"])
 
     # ------------------------------------------------------------------ updates
     def _spectral(self, p, group, bufs, coef, gen, alpha_t, refresh):
         st = self.state[p]
         mshape = st["mshape"]
         m_, n_ = mshape[-2:]
+        numel = p.numel()
         lr = group["lr"] * group["lr_mult"]
         beta, nesterov = group["momentum"], group["nesterov"]
         ns_dtype = P.resolve_dtype(self.ns_dtype, p.device)
-        g = self._grad(p, mshape, coef)
-        mf = self._decode(bufs, "mf", mshape)
+        fmt_f, fmt_s = self.state_dtype, self.slow_dtype
+        flat_w, flat_g = self._flat(p)
+        use_ms = alpha_t > 0 and self.combine == "sum"
+        mf_q, mf_s = self._new_like(bufs, "mf")
+        new = {"mf.q": mf_q, "mf.s": mf_s}
+        slow_w = None
+        if refresh:
+            st["n_slow"] += 1
+            slow_w = 1.0 / min(self.slow_horizon / self.slow_every, st["n_slow"])
+            if self.slow_master == "device":
+                ms_q, ms_s = self._new_like(bufs, "ms")
+                new["ms.q"], new["ms.s"] = ms_q, ms_s
 
-        if self.soft_kappa > 0:
-            r2 = (g - mf).pow(2).mean()
+        # pass 1, per chunk: momentum update, the direction c, the slow-buffer refresh
+        c = torch.empty(numel, device=p.device, dtype=torch.float32)
+        noise = torch.zeros((), device=p.device) if self.soft_kappa > 0 else None
+        for a, b in self._chunks(numel, n_):
+            g = flat_g[a:b].float()
+            if coef != 1.0:
+                g.mul_(coef)
+            mf = Q.decode_range(bufs["mf.q"], bufs["mf.s"], fmt_f, a, b - a)
+            if noise is not None:
+                noise += (g - mf).square().sum()
+            mf.lerp_(g, 1 - beta)
+            ca = c[a:b]
+            if nesterov:
+                torch.lerp(mf, g, 1 - beta, out=ca)
+            else:
+                ca.copy_(mf)
+            del g
+            if use_ms:
+                ca.add_(Q.decode_range(bufs["ms.q"], bufs["ms.s"], fmt_s, a, b - a), alpha=alpha_t)
+            Q.encode_into(mf_q, mf_s, fmt_f, mf, a, gen)
+            if refresh:
+                if self.slow_master == "device":
+                    ms = Q.decode_range(bufs["ms.q"], bufs["ms.s"], fmt_s, a, b - a).lerp_(mf, slow_w)
+                    Q.encode_into(ms_q, ms_s, fmt_s, ms, a, gen)          # a master: stochastic rounding
+                else:
+                    st["ms_host"].view(-1)[a:b].lerp_(mf.to("cpu"), slow_w)
+            del mf
+
+        if noise is not None:
+            r2 = noise / numel
             if st["s2_init"]:
                 st["s2"].lerp_(r2, 1 - self.noise_beta)
             else:
                 st["s2"], st["s2_init"] = r2, True
 
-        mf.lerp_(g, 1 - beta)
-        c = torch.lerp(mf, g, 1 - beta) if nesterov else mf.clone()
-        del g
-        if alpha_t > 0 and self.combine == "sum":
-            c.add_(self._decode(bufs, "ms", mshape), alpha=alpha_t)
-
+        # orthogonalize the whole matrix (Newton-Schulz needs it in one piece)
+        c = c.view(mshape)
         if self.soft_kappa > 0:
             if nesterov:
                 var_c = beta ** 4 * (1 - beta) / (1 + beta) + ((1 - beta) * (1 + beta)) ** 2
             else:
                 var_c = (1 - beta) / (1 + beta)
-            if alpha_t > 0 and self.combine == "sum":
+            if use_ms:
                 var_c += alpha_t ** 2 / (2 * self.slow_horizon - 1)   # (1-b_s)/(1+b_s), b_s = 1 - 1/H
             s2 = st["s2"] * ((1 + beta) / 2)                           # E[(g - m_f)^2] -> per-step noise
             eps = self.soft_kappa * torch.sqrt(s2 * var_c) * (math.sqrt(m_) + math.sqrt(n_))
@@ -310,64 +348,111 @@ class LHMuon(torch.optim.Optimizer):
         else:
             U = P.newton_schulz(c, self.ns_steps, ns_dtype)
         del c
-        if alpha_t > 0 and self.combine == "separate":
-            U.add_(self._decode(bufs, "S", mshape), alpha=alpha_t)
+        U = U.reshape(-1)
 
-        W, inplace = self._weights(p, mshape)
+        # the slow buffer's snapshot (host master) or polar factor (combine="separate") at a refresh
+        if refresh and (self.slow_master == "host" or self.combine == "separate"):
+            if self.slow_master == "device":
+                ms_full = Q.decode(new["ms.q"], new["ms.s"], fmt_s, mshape)
+            else:
+                ms_full = st["ms_host"].to(p.device, non_blocking=True)
+                if self.combine == "sum":
+                    new["ms.q"], new["ms.s"] = Q.encode(ms_full, fmt_s, gen, stochastic=False)   # snapshot: nearest
+            if self.combine == "separate":
+                new["S.q"], new["S.s"] = Q.encode(P.newton_schulz(ms_full, self.ns_steps, ns_dtype), fmt_s,
+                                                  gen, stochastic=False)
+            del ms_full
+
+        # pass 2 (and 3 for the sphere), per chunk: the weight update
         wd = group["weight_decay"]
         sphere = self.norm_control == "sphere" and st["sphere"]
-        if (self.norm_control == "wd" or (self.norm_control == "sphere" and not sphere)) and wd:
-            W.mul_(1 - lr * wd)
-        W.add_(U, alpha=-lr * self.rms_scale * math.sqrt(max(m_, n_)))
-        del U
-        if sphere:
-            W.mul_(st["radius"] / W.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-12))
-        self._commit(p, W, inplace, gen)
+        decay = 1 - lr * wd if (self.norm_control == "wd" or (self.norm_control == "sphere" and not sphere)) and wd else 1.0
+        step = -lr * self.rms_scale * math.sqrt(max(m_, n_))
+        use_S = alpha_t > 0 and self.combine == "separate"
 
-        new = {}
-        self._encode(new, "mf", mf, gen)
-        if refresh:
-            st["n_slow"] += 1
-            w = 1.0 / min(self.slow_horizon / self.slow_every, st["n_slow"])
-            if self.slow_master == "device":
-                ms = self._decode(bufs, "ms", mshape).lerp_(mf, w)
-                self._encode(new, "ms", ms, gen)                       # a master: stochastic rounding
-            else:
-                host = st["ms_host"]
-                host.lerp_(mf.to("cpu"), w)
-                ms = host.to(p.device, non_blocking=True)
-                if self.combine == "sum":
-                    self._encode(new, "ms", ms, gen, stochastic=False)  # a snapshot: round to nearest
-            if self.combine == "separate":
-                self._encode(new, "S", P.newton_schulz(ms, self.ns_steps, ns_dtype), gen, stochastic=False)
+        def updated(a, b, copy=False):
+            # copy=True for the sphere's measuring pass: for fp32 weights .float() is the weight itself
+            W = flat_w[a:b].to(torch.float32, copy=copy)
+            if decay != 1.0:
+                W.mul_(decay)
+            u = U[a:b]
+            if use_S:
+                u = u + alpha_t * Q.decode_range(bufs["S.q"], bufs["S.s"], fmt_s, a, b - a)
+            return W.add_(u, alpha=step)
+
+        factor = None
+        if sphere:                                                  # norm of each updated matrix first
+            rows = torch.zeros(numel // n_, device=p.device)
+            for a, b in self._chunks(numel, n_):
+                rows[a // n_:b // n_] = updated(a, b, copy=True).view(-1, n_).square().sum(1)
+            norms = rows.view(-1, m_).sum(1).sqrt()                  # one per matrix (per expert if batched)
+            factor = (st["radius"].reshape(-1) / norms.clamp_min(1e-12)).repeat_interleave(m_)   # one per row
+        for a, b in self._chunks(numel, n_):
+            W = updated(a, b)
+            if factor is not None:
+                W.view(-1, n_).mul_(factor[a // n_:b // n_, None])
+            self._write(flat_w[a:b], W, gen)
         return new
 
     def _factored(self, p, group, bufs, coef, gen):
         st = self.state[p]
-        mshape = st["mshape"]
+        R, C = st["mshape"]
+        numel = p.numel()
         lr = group["lr"] * group["lr_mult"]
         b1, b2 = group["adam_betas"]
         st["t"] += 1
         t = st["t"]
-        g = self._grad(p, mshape, coef)
-        m = self._decode(bufs, "mf", mshape).lerp_(g, 1 - b1)
-        g2 = g.square_().add_(1e-30)
-        st["vr"].lerp_(g2.mean(dim=1), 1 - b2)
-        st["vc"].lerp_(g2.mean(dim=0), 1 - b2)
-        del g, g2
-        v = torch.outer(st["vr"], st["vc"]).div_(st["vr"].mean().clamp_min(1e-30) * (1 - b2 ** t))
-        upd = (m / (1 - b1 ** t)).div_(v.sqrt_().add_(group["adam_eps"]))
-        del v
+        fmt = self.state_dtype
+        flat_w, flat_g = self._flat(p)
+
+        # pass 1: the factored second moment (row means are per chunk, column means are summed)
+        vr_new = torch.empty(R, device=p.device)
+        col = torch.zeros(C, device=p.device)
+        for a, b in self._chunks(numel, C):
+            g2 = flat_g[a:b].float()
+            if coef != 1.0:
+                g2.mul_(coef)
+            g2 = g2.square_().add_(1e-30).view(-1, C)
+            vr_new[a // C:b // C] = g2.mean(dim=1)
+            col += g2.sum(dim=0)
+            del g2
+        st["vr"].lerp_(vr_new, 1 - b2)
+        st["vc"].lerp_(col / R, 1 - b2)
+        norm = st["vr"].mean().clamp_min(1e-30) * (1 - b2 ** t)
+
+        def momentum_and_update(a, b):
+            g = flat_g[a:b].float()
+            if coef != 1.0:
+                g.mul_(coef)
+            m = Q.decode_range(bufs["mf.q"], bufs["mf.s"], fmt, a, b - a).lerp_(g, 1 - b1)
+            del g
+            v = torch.outer(st["vr"][a // C:b // C], st["vc"]).div_(norm).reshape(-1)
+            upd = (m / (1 - b1 ** t)).div_(v.sqrt_().add_(group["adam_eps"]))
+            return m, upd
+
+        # pass 2 (only with clipping): the RMS of the whole update
+        clip = None
         if self.factored_clip:
-            upd.div_((upd.square().mean().sqrt() / self.factored_clip).clamp_min(1.0))
-        W, inplace = self._weights(p, mshape)
-        if group["weight_decay"]:
-            W.mul_(1 - lr * group["weight_decay"])
-        W.add_(upd, alpha=-lr)
-        self._commit(p, W, inplace, gen)
-        new = {}
-        self._encode(new, "mf", m, gen)
-        return new
+            sq = torch.zeros((), device=p.device)
+            for a, b in self._chunks(numel, C):
+                _, upd = momentum_and_update(a, b)
+                sq += upd.square().sum()
+            clip = (torch.sqrt(sq / numel) / self.factored_clip).clamp_min(1.0)
+
+        # pass 3: apply
+        mf_q, mf_s = self._new_like(bufs, "mf")
+        for a, b in self._chunks(numel, C):
+            m, upd = momentum_and_update(a, b)
+            if clip is not None:
+                upd.div_(clip)
+            W = flat_w[a:b].float()
+            if group["weight_decay"]:
+                W.mul_(1 - lr * group["weight_decay"])
+            W.add_(upd, alpha=-lr)
+            del upd
+            self._write(flat_w[a:b], W, gen)
+            Q.encode_into(mf_q, mf_s, fmt, m, a, gen)
+        return {"mf.q": mf_q, "mf.s": mf_s}
 
     def _adamw(self, p, group, coef, gen):
         st = self.state[p]
@@ -375,28 +460,39 @@ class LHMuon(torch.optim.Optimizer):
         b1, b2 = group["adam_betas"]
         st["t"] += 1
         t = st["t"]
-        g = self._grad(p, None, coef)
-        st["exp_avg"].lerp_(g, 1 - b1)
-        st["exp_avg_sq"].mul_(b2).addcmul_(g, g, value=1 - b2)
-        denom = (st["exp_avg_sq"] / (1 - b2 ** t)).sqrt_().add_(group["adam_eps"])
-        W, inplace = self._weights(p, None)
-        if group["weight_decay"]:
-            W.mul_(1 - lr * group["weight_decay"])
-        W.addcdiv_(st["exp_avg"], denom, value=-lr / (1 - b1 ** t))
-        self._commit(p, W, inplace, gen)
+        flat_w, flat_g = self._flat(p)
+        ea, es = st["exp_avg"].view(-1), st["exp_avg_sq"].view(-1)
+        for a, b in self._chunks(p.numel(), 1):
+            g = flat_g[a:b].float()
+            if coef != 1.0:
+                g.mul_(coef)
+            ea[a:b].lerp_(g, 1 - b1)
+            es[a:b].mul_(b2).addcmul_(g, g, value=1 - b2)
+            del g
+            denom = (es[a:b] / (1 - b2 ** t)).sqrt_().add_(group["adam_eps"])
+            W = flat_w[a:b].float()
+            if group["weight_decay"]:
+                W.mul_(1 - lr * group["weight_decay"])
+            W.addcdiv_(ea[a:b], denom, value=-lr / (1 - b1 ** t))
+            self._write(flat_w[a:b], W, gen)
 
     def _lion(self, p, group, coef, gen):
         """Chen et al. 2023: W <- W(1 - lr wd) - lr sign(b1 m + (1-b1) g);  m <- b2 m + (1-b2) g."""
         st = self.state[p]
         lr = group["lr"] * group["lr_mult"]
         b1, b2 = group["lion_betas"]
-        g = self._grad(p, None, coef)
-        W, inplace = self._weights(p, None)
-        if group["weight_decay"]:
-            W.mul_(1 - lr * group["weight_decay"])
-        W.add_(torch.lerp(st["exp_avg"], g, 1 - b1).sign_(), alpha=-lr)
-        st["exp_avg"].lerp_(g, 1 - b2)
-        self._commit(p, W, inplace, gen)
+        flat_w, flat_g = self._flat(p)
+        ea = st["exp_avg"].view(-1)
+        for a, b in self._chunks(p.numel(), 1):
+            g = flat_g[a:b].float()
+            if coef != 1.0:
+                g.mul_(coef)
+            W = flat_w[a:b].float()
+            if group["weight_decay"]:
+                W.mul_(1 - lr * group["weight_decay"])
+            W.add_(torch.lerp(ea[a:b], g, 1 - b1).sign_(), alpha=-lr)
+            ea[a:b].lerp_(g, 1 - b2)
+            self._write(flat_w[a:b], W, gen)
 
     # ------------------------------------------------------------------ step
     @torch.no_grad()
