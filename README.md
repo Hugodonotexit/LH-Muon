@@ -393,9 +393,26 @@ the 64 real momentum matrices saved in the benchmark checkpoints:
 
 Earlier versions cast the raw momentum to fp16 *before* normalizing it, and entries around 1e-6
 flushed to zero. That is fixed, and a regression test covers it. All published benchmark results
-used fp32 Newton–Schulz and are unaffected. An end-to-end training check of fp16 Newton–Schulz
-is in progress, so `ns_dtype="auto"` still keeps fp32 on pre-Ampere GPUs. The training script
-takes `--ns-dtype fp16`.
+used fp32 Newton–Schulz and are unaffected.
+
+Training with fp16 Newton–Schulz gives the same loss as fp32 (47M model, 131M tokens, seed 0):
+
+| | fp32 NS | fp16 NS | difference |
+|---|---|---|---|
+| Muon | 3.5929 | 3.5934 | +0.0004 |
+| LH-Muon, α = 0.25 | 3.6084 | 3.6070 | −0.0014 |
+
+Both differences are well inside the ≈ 0.005 seed noise. The speedup grows with matrix size
+(Muon optimizer step on an idle V100, busy host):
+
+| model | fp32 NS | fp16 NS | speedup |
+|---|---|---|---|
+| 47M GPT | 143 ms | 146 ms | none (kernel-launch bound) |
+| 117M GPT | 209 ms | 159 ms | 1.3× |
+| 964M hybrid-attention transformer | 3,660 ms | 1,384 ms | 2.6× |
+
+`ns_dtype="auto"` keeps fp32 on pre-Ampere GPUs so that the published runs reproduce exactly;
+pass `ns_dtype="fp16"` (or `--ns-dtype fp16`) to get the speedup.
 
 ## Reproducing the benchmark
 
