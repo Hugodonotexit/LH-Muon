@@ -40,14 +40,17 @@ def test_roundtrip_error_bound(fmt):
     xb = Q._blocks(x, Q.BLOCK[fmt])
     step = xb.abs().amax(1, keepdim=True) / Q.QMAX.get(fmt, 1.0)
     err = Q._blocks(y - x, Q.BLOCK[fmt]).abs()
-    if fmt in Q.QMAX:
-        assert (err <= step / 2 + 1e-6 * step).all()
+    if fmt == "nf4":                                              # half the widest gap between NF4 levels
+        assert (err <= 0.153 * xb.abs().amax(1, keepdim=True) + 1e-30).all()
+    elif fmt in Q.QMAX:
+        slack = 1.01 if fmt == "int4b16" else 1.0 + 1e-6            # int4b16's bf16 scale is rounded up
+        assert (err <= step / 2 * slack).all()
     else:
         rel = {"fp16": 2 ** -11, "bf16": 2 ** -8}[fmt]
         assert (err <= step * rel + 1e-30).all()
 
 
-@pytest.mark.parametrize("fmt", ["int8", "int4"])
+@pytest.mark.parametrize("fmt", ["int8", "int4", "int4b16", "nf4"])
 def test_stochastic_encode_is_unbiased(fmt):
     g = torch.Generator(device=DEV).manual_seed(1)
     x = torch.linspace(-1, 1, 256, device=DEV)
@@ -56,7 +59,7 @@ def test_stochastic_encode_is_unbiased(fmt):
     for _ in range(n):
         q, s = Q.encode(x, fmt, g)
         acc += Q.decode(q, s, fmt, x.shape)
-    step = 1.0 / Q.QMAX[fmt]
+    step = 1.0 / Q.QMAX[fmt] if fmt in Q.QMAX else 0.33                 # nf4's widest gap between levels
     assert (acc / n - x).abs().max() < 4 * step * 0.5 / math.sqrt(n) + 1e-6
 
 

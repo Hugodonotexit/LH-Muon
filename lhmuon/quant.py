@@ -11,6 +11,8 @@ payload is only a storage format. Formats:
     fp16   x / absmax in fp16            64      16.5
     int8   round(x / absmax * 127)       256     8.125
     int4   round(x / absmax * 7), packed 64      4.5
+    int4b16  as int4, bf16 scale          16      5
+    nf4    16 levels denser near 0 (NF4)  64      4.5
 
 The fp16/bf16 payloads are normalised by their block absmax too, so an fp16 state tensor can
 neither overflow nor flush its small entries to zero: the payload lives in [-1, 1] where fp16 has
@@ -24,9 +26,33 @@ quantization step. It still adds noise; see the README ("int4") for when that ma
 import torch
 import torch.nn.functional as F
 
-FORMATS = ("fp32", "bf16", "fp16", "int8", "int4")
-BLOCK = {"bf16": 256, "fp16": 64, "int8": 256, "int4": 64}
-QMAX = {"int8": 127.0, "int4": 7.0}
+FORMATS = ("fp32", "bf16", "fp16", "int8", "int4", "int4b16", "nf4")
+BLOCK = {"bf16": 256, "fp16": 64, "int8": 256, "int4": 64, "int4b16": 16, "nf4": 64}
+QMAX = {"int8": 127.0, "int4": 7.0, "int4b16": 7.0}
+# NF4 levels (QLoRA): quantiles of a normal distribution, scaled to [-1, 1]; 0 is exact.
+NF4 = (-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635,
+       -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725,
+       0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
+       0.7229568362236328, 1.0)
+_NF4_CACHE = {}
+
+
+def _nf4_levels(device):
+    if device not in _NF4_CACHE:
+        _NF4_CACHE[device] = torch.tensor(NF4, device=device, dtype=torch.float32)
+    return _NF4_CACHE[device]
+
+
+def _pack4(u, rows):
+    """uint8 codes 0..15 -> two per byte."""
+    u = u.to(torch.uint8).view(-1, 2)
+    return (u[:, 0] | (u[:, 1] << 4)).view(rows, -1)
+
+
+def _unpack4(q):
+    lo = (q & 0x0F).to(torch.int64)
+    hi = (q >> 4).to(torch.int64)
+    return torch.stack((lo, hi), dim=-1).view(q.shape[0], -1)
 
 
 def _rand(shape, like, generator):
@@ -68,18 +94,34 @@ def encode(x: torch.Tensor, fmt: str, generator: torch.Generator = None, stochas
         raise ValueError(f"unknown state format {fmt!r}; expected one of {FORMATS}")
     xb = _blocks(x, BLOCK[fmt])
     absmax = xb.abs().amax(dim=1, keepdim=True)
+    if fmt == "int4b16":
+        # bf16 scale, rounded UP so |x / scale| <= 1 still holds (bf16, not fp16: momentum block
+        # maxima can sit below fp16's normal range and lose precision there)
+        sc = absmax.to(torch.bfloat16)
+        sc = torch.where(sc.float() < absmax, torch.nextafter(sc, torch.full_like(sc, float("inf"))), sc)
+        absmax, store = sc.float(), sc
+    else:
+        store = absmax
     safe = torch.where(absmax > 0, absmax, torch.ones_like(absmax))
     y = xb / safe                                                    # in [-1, 1]
     if fmt in ("bf16", "fp16"):
-        return y.to(torch.bfloat16 if fmt == "bf16" else torch.float16), absmax
+        return y.to(torch.bfloat16 if fmt == "bf16" else torch.float16), store
+    if fmt == "nf4":
+        lv = _nf4_levels(y.device)
+        hi = torch.searchsorted(lv, y.clamp(-1, 1).contiguous()).clamp_(1, 15)   # levels[hi-1] <= y <= levels[hi]
+        lo_v, hi_v = lv[hi - 1], lv[hi]
+        if stochastic:
+            up = _rand(y.shape, y, generator) < (y - lo_v) / (hi_v - lo_v)
+        else:
+            up = (y - lo_v) > (hi_v - y)
+        return _pack4(torch.where(up, hi, hi - 1), xb.shape[0]), store
     qmax = QMAX[fmt]
     y = y * qmax
     y = torch.floor(y + _rand(y.shape, y, generator)) if stochastic else torch.round(y)
     q = y.clamp_(-qmax, qmax).to(torch.int8)
-    if fmt == "int4":
-        u = (q + 8).to(torch.uint8).view(-1, 2)                      # 1..15, two nibbles per byte
-        q = (u[:, 0] | (u[:, 1] << 4)).view(xb.shape[0], -1)
-    return q, absmax
+    if fmt in ("int4", "int4b16"):
+        q = _pack4(q + 8, xb.shape[0])                               # 1..15, two nibbles per byte
+    return q, store
 
 
 def decode(q: torch.Tensor, s: torch.Tensor, fmt: str, shape) -> torch.Tensor:
@@ -89,15 +131,15 @@ def decode(q: torch.Tensor, s: torch.Tensor, fmt: str, shape) -> torch.Tensor:
     numel = 1
     for d in shape:
         numel *= d
-    if fmt == "int4":
-        lo = (q & 0x0F).to(torch.int8) - 8
-        hi = (q >> 4).to(torch.int8) - 8
-        y = torch.stack((lo, hi), dim=-1).view(q.shape[0], -1).float() / QMAX["int4"]
+    if fmt in ("int4", "int4b16"):
+        y = (_unpack4(q) - 8).float() / QMAX[fmt]
+    elif fmt == "nf4":
+        y = _nf4_levels(q.device)[_unpack4(q)]
     elif fmt == "int8":
         y = q.float() / QMAX["int8"]
     else:
         y = q.float()
-    return (y * s).reshape(-1)[:numel].view(shape)
+    return (y * s.float()).reshape(-1)[:numel].view(shape)
 
 
 def zeros(shape, fmt: str, device):
@@ -108,8 +150,8 @@ def zeros(shape, fmt: str, device):
 def bytes_per_param(fmt: str) -> float:
     if fmt == "fp32":
         return 4.0
-    payload = {"bf16": 2.0, "fp16": 2.0, "int8": 1.0, "int4": 0.5}[fmt]
-    return payload + 4.0 / BLOCK[fmt]
+    payload = {"bf16": 2.0, "fp16": 2.0, "int8": 1.0, "int4": 0.5, "int4b16": 0.5, "nf4": 0.5}[fmt]
+    return payload + (2.0 if fmt == "int4b16" else 4.0) / BLOCK[fmt]
 
 
 # ---------------------------------------------------------------------------

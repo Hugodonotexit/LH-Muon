@@ -22,14 +22,14 @@ AdamW, Lion and factored-Adam update rules, so every baseline runs through the s
 lhmuon/
   optimizer.py   LHMuon: spectral (LH-Muon / Muon), factored Adam, AdamW and Lion update rules
   polar.py       Newton–Schulz polar factor; soft_polar = C (CᵀC + ε²I)^(-1/2) via augmented NS
-  quant.py       block-scaled state container (fp32/bf16/fp16/int8/int4) + stochastic rounding
+  quant.py       block-scaled state container (fp32/bf16/fp16/int8/int4/int4b16/nf4) + stochastic rounding
   routing.py     which parameter gets which rule; build_param_groups()
 examples/train_lm.py        small GPT on tokenized uint16 shards; adamw / lion / muon / lhmuon arms
 scripts/run_suite.py        the benchmark: LR sweep → ablations → seeds → loss-vs-tokens frontier
 scripts/analyze_suite.py    tables + figures from a suite directory
 scripts/fit_multiplier.py   token multiplier from fully decayed endpoints (L = E + B·D^−β fit)
 scripts/bench_optimizers.py optimizer memory + step time for AdamW, Lion, Muon, LH-Muon
-tests/test_lhmuon.py        46 unit tests
+tests/test_lhmuon.py        50 unit tests
 results/suite/              the published run: report, figures, per-run logs and final evals
 ```
 
@@ -357,7 +357,27 @@ W  ← W(1 − lr·wd) − lr · 0.2·√max(m,n) · U   decoupled wd, RMS-match
 - **Block-scaled state.** Every large state tensor is a payload plus one fp32 absmax per block
   (256 elements for int8/bf16, 64 for int4/fp16). Integer payloads are written with stochastic
   rounding, so a slow EMA drifts correctly instead of freezing. fp16 payloads are normalized to
-  [−1, 1], so they can neither overflow nor flush to zero.
+  [−1, 1], so they can neither overflow nor flush to zero. Two more 4-bit formats exist for
+  experiments: `int4b16` (16 values per bf16 scale, 5 bits) and `nf4` (the 16 NF4 levels, denser
+  near zero, with stochastic rounding between neighbouring levels, 4.5 bits).
+- **How low can LH-Muon's state go?** 47M model, 131M tokens, LH-Muon α = 0.25, seed 0; the
+  reference, both buffers int8, scores 3.6084:
+
+  | fast momentum | slow buffer | GPU bytes per matrix param | loss | vs int8 / int8 |
+  |---|---|---|---|---|
+  | int8 | int8 | 2.0 | 3.6084 | – |
+  | int8 | int4, on GPU | 1.5 | 3.6316 | +0.023 |
+  | int8 | int4 copy of an fp32 master in CPU RAM (`slow_master="host"`) | 1.5 (+4 in CPU RAM) | 3.6063 | **−0.002** |
+  | int4, 64 per block | int8 | 1.5 | 3.6980 | +0.090 |
+  | `int4b16` | int8 | 1.6 | 3.6652 | +0.057 |
+  | `nf4` | int8 | 1.5 | 3.6798 | +0.071 |
+
+  **Keep the fast momentum in int8.** Each step changes it by only 5% (β = 0.95), which is below
+  one 4-bit level, so stochastic rounding adds noise on every step. Newton–Schulz then amplifies
+  that noise, because it scales every direction of the momentum to the same size, including the weak
+  ones where the noise lives. Smaller blocks and non-linear levels reduce the damage but don't
+  remove it. **The slow buffer can be 4-bit**, but only as a snapshot of an fp32 master in CPU RAM,
+  refreshed every K steps, so the rounding error doesn't accumulate.
 - **Offload.** With `offload=True`, all quantized state lives in pinned host memory. The next
   tensor's state is prefetched on a side stream while the current one updates. Results are
   bit-identical to on-device (tested). Transfers are not overlapped with the backward pass.
@@ -457,8 +477,8 @@ it recovers 1.32×.
 
 ## Tests
 
-`python -m pytest tests -q` runs 46 tests. They cover:
-- quantization error bounds, unbiased stochastic encoding (int8, int4) and weight rounding
+`python -m pytest tests -q` runs 50 tests. They cover:
+- quantization error bounds, unbiased stochastic encoding (int8, int4, int4b16, nf4) and weight rounding
   (fp16, bf16, including subnormals);
 - the soft-polar identity (SVD, fp64) and its per-direction shrinkage;
 - `alpha=0` matching a reference Muon to 1e-5, and Lion matching a reference implementation;
