@@ -531,12 +531,12 @@ def main():
     # frontier
     L.append("## 4. Loss vs tokens and the token multiplier (fully decayed endpoints)\n")
     if fits:
-        L.append("| optimizer | " + " | ".join(f"{b // 1_000_000}M" for b in (32768000, 65536000, 131072000, 262144000))
-                 + " | fit L = E + B·D^−β |")
-        L.append("|---|---|---|---|---|---|")
+        budgets = sorted({p[0] for o in ORDER for p in frontier_points(runs, o)})
+        L.append("| optimizer | " + " | ".join(f"{b // 1_000_000}M" for b in budgets) + " | fit L = E + B·D^−β |")
+        L.append("|---|" + "---|" * (len(budgets) + 1))
         for o in ORDER:
             pts = dict(frontier_points(runs, o))
-            cells = [f"{pts[b]:.4f}" if b in pts else "" for b in (32768000, 65536000, 131072000, 262144000)]
+            cells = [f"{pts[b]:.4f}" if b in pts else "" for b in budgets]
             f = fits.get(o)
             L.append(f"| {LABEL[o]} | " + " | ".join(cells) + " | " +
                      (f"E {f[0]:.3f}, B {f[1]:.3g}, β {f[2]:.3f}" if f else "–") + " |")
@@ -545,15 +545,15 @@ def main():
             if base not in fits:
                 continue
             L.append(f"Token multiplier M = D_{LABEL[base]}(L) / D, at each budget of the other optimizers:\n")
-            L.append("| optimizer | " + " | ".join(f"{b // 1_000_000}M" for b in (32768000, 65536000, 131072000, 262144000)) + " |")
-            L.append("|---|---|---|---|---|")
+            L.append("| optimizer | " + " | ".join(f"{b // 1_000_000}M" for b in budgets) + " |")
+            L.append("|---|" + "---|" * len(budgets))
             Dmin, Dmax = min(p[0] for p in frontier_points(runs, base)), max(p[0] for p in frontier_points(runs, base))
             for o in ORDER:
                 if o == base:
                     continue
                 pts = dict(frontier_points(runs, o))
                 cells = []
-                for b in (32768000, 65536000, 131072000, 262144000):
+                for b in budgets:
                     if b not in pts:
                         cells.append("")
                         continue

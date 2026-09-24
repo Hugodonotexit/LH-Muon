@@ -6,13 +6,14 @@ packaged with a memory-lean state container (block-scaled int8/int4 optimizer st
 offload) and fp16-safe updates. It is a drop-in `torch.optim.Optimizer`, and it also includes
 AdamW, Lion and factored-Adam update rules, so every baseline runs through the same code path.
 
-> **Result: mostly negative, with one open lead.** On a 47M-parameter GPT, every slow-momentum
-> setting is worse than plain Muon at 131M tokens. The best variant (α = 0.25) is
-> **+0.017 ± 0.002 nats** worse, paired over 3 seeds, against a noise level of ≈ 0.005. The
-> default (α = 2) is +0.106 worse. But LH-Muon's deficit **shrinks steadily with training
-> length** and flips sign at the longest budget tested: +0.110 → +0.039 → +0.015 → **−0.010** at
-> 33M → 66M → 131M → 262M tokens. That last point is single-seed and only about 2σ, so it is a
-> lead, not a result. LH-Muon costs about +1 byte/parameter of optimizer memory and ≈ 0.5% of
+> **Result: worse than Muon on short runs, better on the longest runs tested.** On a
+> 47M-parameter GPT at 131M tokens, every slow-momentum setting loses to plain Muon. The best
+> variant (α = 0.25) is **+0.017 ± 0.002 nats** worse, paired over 3 seeds, against a noise level
+> of ≈ 0.005. But its deficit shrinks steadily with training length and then reverses:
+> +0.110 → +0.039 → +0.015 → −0.010 → **−0.028** at 33M → 66M → 131M → 262M → 524M tokens
+> (0.7–11 tokens/param). At 524M that is roughly **1.3× fewer tokens than Muon for the same loss**.
+> The long-budget points are single-seed and one model size, so this is a promising lead, not an
+> established result. LH-Muon costs about +1 byte/parameter of optimizer memory and ≈ 0.5% of
 > training time over Muon. Full numbers are [below](#results).
 
 ## Contents
@@ -27,6 +28,7 @@ examples/train_lm.py        small GPT on tokenized uint16 shards; adamw / lion /
 scripts/run_suite.py        the benchmark: LR sweep → ablations → seeds → loss-vs-tokens frontier
 scripts/analyze_suite.py    tables + figures from a suite directory
 scripts/fit_multiplier.py   token multiplier from fully decayed endpoints (L = E + B·D^−β fit)
+scripts/bench_optimizers.py optimizer memory + step time for AdamW, Lion, Muon, LH-Muon
 tests/test_lhmuon.py        36 unit tests
 results/suite/              the published run: report, figures, per-run logs and final evals
 ```
@@ -50,7 +52,8 @@ results/suite/              the published run: report, figures, per-run logs and
 - **Hardware:** V100s.
 
 The benchmark ran in four stages (`scripts/run_suite.py`): an LR sweep, LH-Muon ablations, 3 seeds
-per optimizer at its best setting, and a loss-vs-tokens frontier. That is 51 runs in total; every
+per optimizer at its best setting, and a loss-vs-tokens frontier, plus a 524M-token extension for
+Muon and LH-Muon. That is 53 runs in total; every
 run's log and final eval are in [`results/suite/runs`](results/suite/runs), and the generated report
 is [`results/suite/report/report.md`](results/suite/report/report.md).
 
@@ -61,7 +64,7 @@ is [`results/suite/report/report.md`](results/suite/report/report.md).
 | **Muon** | 8e-3 | **3.592 ± 0.001** | – | −0.114 ± 0.000 | 1× |
 | LH-Muon, α = 0.25 | 2e-3 | 3.609 ± 0.002 | +0.017 ± 0.002 | −0.097 ± 0.002 | 0.92× |
 | LH-Muon, α = 2 (default) | 2e-3 | 3.698 ± 0.007 | +0.106 ± 0.003 | −0.008 ± 0.004 | 0.67× |
-| AdamW | 2e-3 | 3.707 ± 0.001 | +0.114 ± 0.000 | – | 0.65× |
+| AdamW | 2e-3 | 3.707 ± 0.001 | +0.114 ± 0.000 | – | 0.66× |
 | Lion | 1.5e-4 | 3.928 ± 0.007 | +0.336 ± 0.005 | +0.221 ± 0.005 | 0.36× |
 
 The last column is the token multiplier: the tokens Muon needs to reach that optimizer's loss,
@@ -82,36 +85,40 @@ comparisons.
 ### Loss vs tokens (stage 4)
 
 Each optimizer at its best setting had one 262M-token run, with fully decayed branches at 33M, 66M
-and 131M tokens. That gives 4 decayed endpoints per optimizer (seed 0), fitted with
+and 131M tokens. Muon and LH-Muon were then extended to 524M tokens (11 tokens/param) by branching
+a longer run from the 105M-token checkpoint. Resuming was checked: the first eval after the resume
+matched the original run within 0.001. Every point is a fully decayed endpoint, seed 0, fitted with
 L = E + B·D^−β.
 
 ![loss vs tokens and the gap to Muon](results/suite/report/fig4_frontier.png)
 
-| optimizer | 33M | 66M | 131M | 262M |
-|---|---|---|---|---|
-| Muon | 4.116 | 3.793 | 3.592 | 3.452 |
-| LH-Muon, α = 0.25 | 4.227 | 3.832 | 3.607 | **3.442** |
-| AdamW | 4.503 | 3.991 | 3.714 | 3.513 |
-| Lion | 5.242 | 4.566 | 3.947 | 3.579 |
-| **LH-Muon − Muon** | +0.110 | +0.039 | +0.015 | **−0.010** |
+| optimizer | 33M | 66M | 131M | 262M | 524M |
+|---|---|---|---|---|---|
+| Muon | 4.116 | 3.793 | 3.592 | 3.452 | 3.353 |
+| LH-Muon, α = 0.25 | 4.227 | 3.832 | 3.607 | **3.442** | **3.325** |
+| AdamW | 4.503 | 3.991 | 3.714 | 3.513 | – |
+| Lion | 5.242 | 4.566 | 3.947 | 3.579 | – |
+| **LH-Muon − Muon** | +0.110 | +0.039 | +0.015 | **−0.010** | **−0.028** |
 
 Token multipliers against the fitted Muon curve (> 1 = needs fewer tokens than Muon; * =
 extrapolated beyond Muon's measured range):
 
-| vs Muon | 33M | 66M | 131M | 262M |
-|---|---|---|---|---|
-| LH-Muon, α = 0.25 | 0.83×* | 0.91× | 0.93× | 1.08×* |
-| AdamW | 0.57×* | 0.63× | 0.64× | 0.71× |
-| Lion | 0.28×* | 0.26×* | 0.35× | 0.52× |
+| vs Muon | 33M | 66M | 131M | 262M | 524M |
+|---|---|---|---|---|---|
+| LH-Muon, α = 0.25 | 0.83×* | 0.92× | 0.93× | 1.04× | 1.35×* |
+| AdamW | 0.56×* | 0.64× | 0.64× | 0.70× | – |
+| Lion | 0.26×* | 0.26×* | 0.35× | 0.52× | – |
 
-- **Muon needs 1.44–1.65× fewer tokens than AdamW** across the budgets (fitted against AdamW's
+- **LH-Muon's gap to Muon closes monotonically and then reverses.** That is the pattern a slow
+  momentum should show: its long horizon only pays off once runs are long compared with it.
+- **The 524M multiplier is extrapolated**, since LH-Muon's loss there is below anything Muon
+  reached. A local-slope estimate from the fit gives a similar ≈ 1.30×.
+- **The two negative points are single-seed.** −0.028 is about 5σ of the paired seed noise
+  measured at 131M. The monotone trend across five budgets carries more weight than any one point.
+- **Muon needs 1.44–1.66× fewer tokens than AdamW** across the budgets (fitted against AdamW's
   curve). That is in line with published Muon results, which suggests the harness is sound.
-- **LH-Muon's gap to Muon closes monotonically** as training gets longer. This is the pattern a
-  slow momentum should show: its long horizon only pays off once runs are long compared with it.
-  The 262M crossover is a single seed at ≈ 2σ, so it needs seeds and a longer budget before it
-  counts.
 - **AdamW and Lion also close on Muon with more tokens.** Lion improves fastest: its loss curve has
-  the smallest fitted exponent, β = 0.38 against 0.62–0.72 for the others.
+  the smallest fitted exponent, β = 0.38 against 0.59–0.72 for the others.
 
 ### LR sweep (stage 1, seed 0)
 
@@ -155,27 +162,68 @@ All at LH-Muon's LR of 2e-3; Muon at the same LR scores 3.596.
 - **Lion is probably under-tuned.** Only its LR was swept; weight decay 0.7 and betas
   (0.9, 0.99) were fixed, and the 65k-token batch is small for sign updates.
 
-### Resource cost: LH-Muon vs Muon
+### Resource cost: all four optimizers
 
-LH-Muon adds one buffer, the slow momentum, per hidden weight matrix. It runs the same single
-Newton–Schulz orthogonalization per step as Muon, so compute barely changes.
+**Optimizer memory and step time.** This is a controlled benchmark (`scripts/bench_optimizers.py`):
+fp16 weights, synthetic gradients, all four optimizers through the same code path, on an RTX 3060.
+The GPU was shared, so treat step times as ±10–15%. In this harness AdamW and Lion keep fp32
+state, while Muon and LH-Muon keep int8.
+
+| | AdamW | Lion | Muon | LH-Muon (α = 0.25) |
+|---|---|---|---|---|
+| state per parameter, as run here | 8.0 B (fp32) | 4.0 B (fp32) | 1.02 B (int8) | 1.57–1.75 B (int8) |
+| state, 47M model | 360 MiB | 180 MiB | 46 MiB | 71 MiB |
+| state, 117M model | 894 MiB | 447 MiB | 114 MiB | 196 MiB |
+| state with 8-bit AdamW / Lion (e.g. bitsandbytes) | ~2 B/param | ~1 B/param | 1.02 B/param | 1.6–1.75 B/param |
+| temporary memory during the step, 117M model | 1.33 GiB | 1.21 GiB | 1.34 GiB | 1.33 GiB |
+| optimizer step, 47M model | 80 ms | 65 ms | 159 ms | 168 ms |
+| optimizer step, 117M model | 131 ms | 101 ms | 266 ms | 299 ms |
+
+- **Muon and LH-Muon steps are ~2× slower** than AdamW's or Lion's because of the Newton–Schulz
+  orthogonalization.
+- **LH-Muon's extra state is only on the hidden matrices.** Embeddings use factored Adam in both
+  Muon variants, and they are 28–46% of these small models. The overhead therefore approaches
+  +1 B/param as models grow.
+
+**Share of training time.** V100, 47M model, median over the suite runs:
+
+| | AdamW | Lion | Muon | LH-Muon |
+|---|---|---|---|---|
+| optimizer time per step | 0.036 s | 0.035 s | 0.079 s | 0.088 s |
+| training step time relative to Muon | 0.95× | 0.95× | 1× | 1.01× |
+
+**Compute to reach the same loss.** This is the number that matters: the tokens each optimizer
+needs (from the token multipliers above) times its relative step time.
+
+| to match Muon's loss at… | AdamW | Lion | Muon | LH-Muon (α = 0.25) |
+|---|---|---|---|---|
+| 131M tokens | 1.49× | 2.72× | **1×** | 1.09× |
+| 262M tokens (single seed) | 1.36× | 1.83× | 1× | **0.97×** |
+| 524M tokens (single seed, extrapolated) | – | – | 1× | **≈ 0.75×** |
+
+- **AdamW and Lion's cheaper steps don't make up for the extra tokens they need.** AdamW costs
+  ~35–50% more compute than Muon to reach the same loss.
+- **Lion is the most expensive overall**, though it closes the gap fastest with more tokens, and it
+  is probably under-tuned here.
+- **LH-Muon is the only optimizer that needs less compute than Muon**, and only from ~260M tokens
+  (5.6 tokens/param) on. At 524M, reaching its loss would take Muon ~1.3× the tokens, which more
+  than pays for LH-Muon's +1% step time.
+
+**LH-Muon vs Muon at larger scale.** Controlled benchmark on a 964M-parameter hybrid-attention
+transformer (880.8M params in 392 hidden matrices), one V100:
 
 | | Muon | LH-Muon |
 |---|---|---|
-| optimizer state per matrix parameter (int8) | 1.0 B | 2.0 B |
-| optimizer state on GPU, 964M-param model | 0.92 GiB | 1.75 GiB |
+| optimizer state on GPU (int8) | 0.92 GiB | 1.75 GiB |
 | … with the slow buffer's fp32 master in CPU RAM and an int4 copy on GPU | – | 1.38 GiB + 3.3 GiB pinned CPU RAM |
 | … with all state offloaded (`offload=True`) | – | 0.01 GiB + 5.0 GiB pinned CPU RAM |
-| optimizer step, 964M-param model, V100 (controlled benchmark) | 3.59 s | 3.83 s (+7%) |
+| optimizer step | 3.59 s | 3.83 s (+7%) |
 | extra cost of a slow-buffer refresh (every 20 steps) | – | +0.2 to +2 s, depending on placement |
-| optimizer time per step, 47M model (median over suite runs) | 0.079 s | 0.077–0.088 s |
-| end-to-end throughput, 47M model | ~70k tok/s | ~72k tok/s (same within noise) |
-| transient working memory during the step | 1.35 GiB | 1.35 GiB |
 | extra hyperparameters | – | α, slow horizon |
 
-- **Net cost:** the optimizer is 5–10% of a training step, so LH-Muon adds about **0.5% to total
-  training time**, plus ~1 byte per matrix parameter of memory.
-- **The biggest practical cost is tuning.** α alone moved the loss from +0.012 to +0.165 against
+- **Net cost of LH-Muon over Muon:** about **0.5% of total training time**, since the optimizer
+  is 5–10% of a step, plus ~1 byte per matrix parameter of memory.
+- **The bigger practical cost is tuning.** α alone moved the loss from +0.012 to +0.165 against
   Muon.
 - **Low-precision caveat:** int4 for *both* buffers cost +0.18 nats; the host-master variant keeps
   only an int4 *copy* of the slow buffer on the GPU, and its quality wasn't tested.
@@ -183,8 +231,10 @@ Newton–Schulz orthogonalization per step as Muon, so compute barely changes.
 ### Limits of this evidence
 
 - One model size (47M).
-- Moderate budgets: up to 5.6 tokens/param, not the ~20 typical of compute-optimal training.
-- The frontier and the ablations are single-seed; only the 131M headline has 3 seeds.
+- Moderate budgets: up to 11 tokens/param (Muon and LH-Muon) or 5.6 (AdamW, Lion), not the ~20
+  typical of compute-optimal training.
+- The frontier and the ablations are single-seed; only the 131M headline has 3 seeds. The
+  crossover in LH-Muon's favour happens only at the single-seed long budgets.
 - LH-Muon's slow horizon was fixed at 300 steps. The α = 0.25 variant was chosen on one seed and
   then used for the seed and frontier stages, which biases slightly in LH-Muon's favour.
 

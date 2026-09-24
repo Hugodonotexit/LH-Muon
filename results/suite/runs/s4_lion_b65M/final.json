@@ -44,8 +44,6 @@
   "eval_every": 100,
   "save_at": "",
   "init_from": "runs/suite/s4_lion_long/stable_52428800.pt",
-  "seed": 0,
-  "device": null,
-  "data": null
+  "seed": 0
  }
 }

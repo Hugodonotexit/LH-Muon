@@ -44,8 +44,6 @@
   "eval_every": 100,
   "save_at": "26214400,52428800,104857600",
   "init_from": "",
-  "seed": 0,
-  "device": null,
-  "data": null
+  "seed": 0
  }
 }
