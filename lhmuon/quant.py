@@ -58,6 +58,73 @@ def _rand(shape, like, generator):
     return torch.rand(shape, generator=generator, device=like.device, dtype=torch.float32)
 
 
+# ---------------------------------------------------------------------------
+# optional torch.compile of the hot element-wise paths
+# ---------------------------------------------------------------------------
+# set_compile(True) runs stochastic rounding, int8 encode and int8 decode as fused compiled kernels
+# instead of ~10 separate full-size passes each. The random numbers are still drawn outside the
+# compiled code (same generator, same order), so the streams and the maths are unchanged; results can
+# differ from the eager path only in the last bit of a fused multiply-add.
+_COMPILE = False
+_COMPILED = {}
+
+
+def set_compile(on: bool):
+    global _COMPILE
+    _COMPILE = bool(on)
+
+
+def _fn(core):
+    if not _COMPILE:
+        return core
+    if core not in _COMPILED:
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+        # emulate_precision_casts: inside a fused kernel inductor otherwise keeps x.to(fp16).float() in
+        # fp32, which silently turns stochastic rounding into "never round" (the rounding IS the cast).
+        _COMPILED[core] = torch.compile(core, dynamic=True, options={"emulate_precision_casts": True})
+    return _COMPILED[core]
+
+
+def _stochastic_round_core(x: torch.Tensor, u: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    x = x.float()
+    if dtype == torch.float16:
+        x = x.clamp(-65504.0, 65504.0)
+    near = x.to(dtype)
+    diff = x - near.float()
+    far = _next_toward(near, diff)
+    spacing = (far.float() - near.float()).abs()
+    prob = torch.where(spacing > 0, diff.abs() / spacing, torch.zeros_like(diff))
+    return torch.where(u < prob, far, near)
+
+
+def _next_toward(v: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:
+    """The fp16/bf16 neighbour of `v` on the side of sign(direction), from the bit pattern: both are
+    sign-magnitude 16-bit formats, so the neighbour away from zero is magnitude + 1 and the one toward
+    zero is magnitude - 1. Unlike torch.nextafter this stays exact under torch.compile, which computes
+    16-bit float maths in fp32 (there nextafter returned the fp32 neighbour, which rounds back to v)."""
+    bits = v.view(torch.int16).to(torch.int32)
+    mag, sign = bits & 0x7FFF, bits & 0x8000
+    up = direction > 0
+    at_zero = mag == 0
+    away = up == (sign == 0)                                  # moving away from zero
+    new_mag = torch.where(at_zero, torch.ones_like(mag), torch.where(away, mag + 1, mag - 1))
+    new_sign = torch.where(at_zero, torch.where(up, torch.zeros_like(sign), torch.full_like(sign, 0x8000)), sign)
+    return (new_sign | new_mag).to(torch.int16).view(v.dtype)
+
+
+def _int8_encode_core(xb: torch.Tensor, u: torch.Tensor):
+    absmax = xb.abs().amax(dim=1, keepdim=True)
+    safe = torch.where(absmax > 0, absmax, torch.ones_like(absmax))
+    y = xb / safe * QMAX["int8"]
+    q = torch.floor(y + u).clamp_(-QMAX["int8"], QMAX["int8"]).to(torch.int8)
+    return q, absmax
+
+
+def _int8_decode_core(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    return q.float() / QMAX["int8"] * s.float()
+
+
 def stochastic_round(x: torch.Tensor, dtype: torch.dtype, generator: torch.Generator = None) -> torch.Tensor:
     """Round fp32 `x` onto the grid of `dtype` (fp16 or bf16) with E[result] == x.
 
@@ -65,16 +132,7 @@ def stochastic_round(x: torch.Tensor, dtype: torch.dtype, generator: torch.Gener
     in the target dtype, so binade edges and subnormals are handled by construction), then moves
     to the neighbour with probability |x - nearest| / spacing. fp16 values beyond +-65504 are
     clamped rather than sent to inf."""
-    x = x.float()
-    if dtype == torch.float16:
-        x = x.clamp(-65504.0, 65504.0)
-    near = x.to(dtype)
-    diff = x - near.float()
-    toward = torch.where(diff >= 0, torch.full_like(near, float("inf")), torch.full_like(near, float("-inf")))
-    far = torch.nextafter(near, toward)
-    spacing = (far.float() - near.float()).abs()
-    prob = torch.where(spacing > 0, diff.abs() / spacing, torch.zeros_like(diff))
-    return torch.where(_rand(x.shape, x, generator) < prob, far, near)
+    return _fn(_stochastic_round_core)(x, _rand(x.shape, x, generator), dtype)
 
 
 def _blocks(x: torch.Tensor, block: int) -> torch.Tensor:
@@ -92,6 +150,8 @@ def encode(x: torch.Tensor, fmt: str, generator: torch.Generator = None, stochas
     if fmt not in BLOCK:
         raise ValueError(f"unknown state format {fmt!r}; expected one of {FORMATS}")
     xb = _blocks(x, BLOCK[fmt])
+    if fmt == "int8" and stochastic:                                 # the hot path: one fused kernel
+        return _fn(_int8_encode_core)(xb, _rand(xb.shape, xb, generator))
     absmax = xb.abs().amax(dim=1, keepdim=True)
     if fmt == "int4b16":
         # bf16 scale, rounded UP so |x / scale| <= 1 still holds (bf16, not fp16: momentum block
@@ -135,7 +195,7 @@ def decode(q: torch.Tensor, s: torch.Tensor, fmt: str, shape) -> torch.Tensor:
     elif fmt == "nf4":
         y = _nf4_levels(q.device)[_unpack4(q).long()]
     elif fmt == "int8":
-        y = q.float() / QMAX["int8"]
+        return _fn(_int8_decode_core)(q, s).reshape(-1)[:numel].view(shape)
     else:
         y = q.float()
     return (y * s.float()).reshape(-1)[:numel].view(shape)

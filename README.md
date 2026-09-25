@@ -350,6 +350,7 @@ W  ← W(1 − lr·wd) − lr · 0.2·√max(m,n) · U   decoupled wd, RMS-match
 | `slow_master` | `"device"` | `"host"`: fp32 slow EMA in pinned host RAM, device holds a round-to-nearest snapshot |
 | `offload` | False | all quantized state in pinned host RAM, streamed per tensor |
 | `chunk_elements` | 4,194,304 | element-wise work runs on chunks of this size; smaller = less temporary memory, more kernel launches |
+| `compile_updates` | False | `torch.compile` the int8 encode/decode and stochastic rounding into fused kernels; optimizer step 1,575 → 1,024 ms on a 964M model (V100) |
 | `adam_betas`, `adam_eps`, `factored_clip` | (0.9, 0.95), 1e-8, 1.0 | factored + adamw kinds |
 
 ## State, precision and memory
@@ -395,6 +396,14 @@ W  ← W(1 − lr·wd) − lr · 0.2·√max(m,n) · U   decoupled wd, RMS-match
   1,377 MiB to 206 MiB at the same speed; `chunk_elements=1 << 20` gets to 77 MiB for ≈ 3% more
   time, and the floor, set by Newton–Schulz on the largest matrix, is ≈ 76 MiB. Chunked and
   unchunked updates agree to float rounding (tested for every update rule).
+- **Compiled updates** (`compile_updates=True`). Two `torch.compile` behaviours silently break
+  stochastic rounding, and the code works around both: `torch.nextafter` on fp16 returns the fp32
+  neighbour inside compiled code (so "the next fp16 value" rounds back to the value itself), and
+  fused kernels drop the `x → fp16 → fp32` round trip, which *is* the rounding. The neighbour is
+  now computed from the 16-bit pattern (checked against `nextafter` on every finite fp16 and bf16
+  value), and the compiled helpers run with `emulate_precision_casts`. The random numbers are
+  drawn outside the compiled code, so seeded runs use the same streams either way. All tests pass
+  in both modes.
 - **Checkpointing.** `state_dict()` keeps the storage format. `load_state_dict()` allocates fresh
   buffers under the current settings, and it refuses a checkpoint saved with a different format
   rather than reinterpreting it. Resume is bit-exact (tested).

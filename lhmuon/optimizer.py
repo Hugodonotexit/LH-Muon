@@ -58,7 +58,7 @@ class LHMuon(torch.optim.Optimizer):
                  adam_betas=(0.9, 0.95), adam_eps: float = 1e-8, factored_clip: float = 1.0,
                  state_dtype: str = "int8", slow_dtype: str = "int8", slow_master: str = "device",
                  offload: bool = False, stochastic_weights: bool = True, min_dim: int = 32, seed: int = 0,
-                 chunk_elements: int = 1 << 22):
+                 chunk_elements: int = 1 << 22, compile_updates: bool = False):
         if combine not in ("sum", "separate"):
             raise ValueError(f"combine must be 'sum' or 'separate', not {combine!r}")
         if norm_control not in ("sphere", "wd", "none"):
@@ -97,6 +97,8 @@ class LHMuon(torch.optim.Optimizer):
         self.stochastic_weights = stochastic_weights
         self.min_dim = min_dim
         self.chunk_elements = int(chunk_elements)   # element-wise work runs on chunks of this many elements
+        if compile_updates:                          # fused kernels for int8 encode/decode + stochastic rounding
+            Q.set_compile(True)
         self.seed = seed
         self.alpha_mult = 1.0      # a trainer may scale alpha per step, e.g. with the LR during the decay phase
         self._t = 0
