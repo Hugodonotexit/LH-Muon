@@ -29,8 +29,11 @@ scripts/run_suite.py        the benchmark: LR sweep → ablations → seeds → 
 scripts/analyze_suite.py    tables + figures from a suite directory
 scripts/fit_multiplier.py   token multiplier from fully decayed endpoints (L = E + B·D^−β fit)
 scripts/bench_optimizers.py optimizer memory + step time for AdamW, Lion, Muon, LH-Muon
+examples/qwen/              continued-pretraining test: data prep, Qwen3.5-0.8B-Base runner, report/figure
+examples/gpt2/              the same test on GPT-2 (124M): runner + LR-grid queue
 tests/test_lhmuon.py        50 unit tests
 results/suite/              the published run: report, figures, per-run logs and final evals
+results/continued_pretraining/  optimizers on already-trained models (GPT-2, Qwen3.5-0.8B-Base)
 ```
 
 ## Results
@@ -228,9 +231,60 @@ transformer (880.8M params in 392 hidden matrices), one V100:
 - **Low-precision caveat:** int4 for *both* buffers cost +0.18 nats; the host-master variant keeps
   only an int4 *copy* of the slow buffer on the GPU, and its quality wasn't tested.
 
+### Continued pretraining from a trained model
+
+The suite above trains from scratch. This test starts from an already-trained model instead, to see
+whether the optimizers rank differently once the loss is already low.
+
+**Setup.**
+- **Data:** an equal mix of five Dolma v1.7 sources (C4, Common Crawl, books, MegaWika, arXiv),
+  about 12M tokens each, retokenized for each model
+  ([`examples/qwen/prep_data.py`](examples/qwen/prep_data.py)).
+- **Metric:** loss on 64 held-out 1024-token windows, 13 per source, cut from documents that are
+  never trained on. It is measured before any training (the base model) and every 50 steps.
+- **Precision and routing:** all runs go through `LHMuon` with bf16 weights, stochastic rounding and
+  WSD. Only the rule for the hidden matrices changes. Embeddings get factored Adam and norms/biases
+  fp32 AdamW in every run.
+- **Hardware:** RTX 3060, one seed per run.
+
+**GPT-2 (124M): all four optimizers improve by about the same amount.** 600 steps × 32 × 1024 =
+19.7M tokens (0.16 tokens/param). Base-model eval loss is 3.3075.
+
+| optimizer | best LR | final eval | vs base | c4 | cc | wiki | books | arxiv |
+|---|---|---|---|---|---|---|---|---|
+| **LH-Muon** (α 0.25, horizon 200) | 1e-4 | **3.0649** | **−0.2427** | −0.089 | −0.074 | −0.061 | −0.467 | −0.523 |
+| Muon | 1e-4 | 3.0652 | −0.2423 | −0.090 | −0.074 | −0.061 | −0.466 | −0.520 |
+| AdamW | 1e-4 | 3.0665 | −0.2410 | −0.086 | −0.074 | −0.059 | −0.465 | −0.521 |
+| Lion | 3e-5 | 3.0714 | −0.2361 | −0.077 | −0.065 | −0.050 | −0.467 | −0.523 |
+
+![GPT-2 continued pretraining](results/continued_pretraining/gpt2/optimizers.png)
+
+- **LH-Muon, Muon and AdamW finish within 0.0016 of each other.** That is below the ≈ 0.005
+  seed noise measured in the suite, so this test does not separate them. Lion is about 0.006 behind.
+- **The learning rate matters more than the optimizer.** At 3e-4, every matrix optimizer is
+  0.018–0.027 worse than at 1e-4, and there Lion looks best. Reading only the 3e-4 column gives the
+  wrong ranking.
+- **Most of the gain is domain shift.** Books and arXiv, which GPT-2's training text barely covers,
+  improve by about 0.5 nats. The general-text sources (C4, Common Crawl, wiki) are the low-loss part
+  of the test, and they improve by 0.05–0.09.
+- **Still being checked:** LH-Muon, Muon and AdamW were each best at the lowest LR tried. Runs at
+  3e-5 are in progress, and this section will be updated.
+
+**Qwen3.5-0.8B-Base: continued pretraining made it worse with every optimizer.** 200 steps × 32 ×
+1024 = 6.6M tokens, one LR per optimizer (1e-5; Lion 2e-6). Base-model eval loss is 2.6565.
+Held-out loss rose for all four: Muon +0.016, LH-Muon +0.021, Lion +0.022, AdamW +0.024. The base
+model is already well annealed, so a short re-warmed run on generic web text mostly disturbs it.
+The test was stopped there, and GPT-2 was used instead
+([report](results/continued_pretraining/qwen/report.md)).
+
+Per-run logs and final evals are in
+[`results/continued_pretraining/`](results/continued_pretraining). To reproduce:
+`python examples/qwen/prep_data.py --model openai-community/gpt2 --tokens 12000000 --out data/gpt2_mix`,
+then `examples/gpt2/run_queue.sh`.
+
 ### Limits of this evidence
 
-This study is finished; no further runs are planned. Read the results with these limits in mind:
+The from-scratch study is finished; no further runs of it are planned. Read the results with these limits in mind:
 
 - **The crossover is unconfirmed.** LH-Muon beats Muon only at 262M and 524M tokens, and those two
   points are a single seed each (seed 0). Extra seeds at those budgets would take ~4 h on 2 V100s and
@@ -246,6 +300,9 @@ This study is finished; no further runs are planned. Read the results with these
 - **LH-Muon had a mild selection advantage.** Its slow horizon was fixed at 300 steps, and the
   α = 0.25 variant was picked on one seed and then reused for the seed and frontier stages.
 - **Lion is probably under-tuned.** Only its LR was swept.
+- **The continued-pretraining test is small.** It uses one seed, two or three LRs per optimizer and
+  under 20M tokens. The LH-Muon 3e-4 GPT-2 run kept its final eval, but its per-step log was
+  overwritten by an accidental rerun, so the published log has only the start and end points.
 - **Resource timings are approximate.** The optimizer benchmark ran on a shared RTX 3060
   (±10–15%); the share-of-training-time numbers come from V100 runs on a shared machine.
 

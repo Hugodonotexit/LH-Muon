@@ -1,0 +1,43 @@
+{
+ "opt": "lion",
+ "lr": 2e-06,
+ "wd": 0.5,
+ "steps": 200,
+ "tokens": 6553600,
+ "base_eval": 2.6564679341438486,
+ "eval": 2.678610754471559,
+ "eval_by_source": {
+  "c4": 2.9685823917388916,
+  "cc": 2.9917390163128195,
+  "books": 2.8058385115403395,
+  "wiki": 2.6191539214207578,
+  "arxiv": 2.007739931344986
+ },
+ "base_by_source": {
+  "c4": 2.939098761631892,
+  "cc": 2.9607596397399902,
+  "books": 2.81811156639686,
+  "wiki": 2.592868988330548,
+  "arxiv": 1.9715007146199544
+ },
+ "seconds": 2963.5697169303894,
+ "peak_gib": 7.049912929534912,
+ "args": {
+  "opt": "lion",
+  "lr": 2e-06,
+  "wd": null,
+  "out": "runs/qwen/lion_lr2e-6",
+  "data": "/home/hugo/lh-muon/examples/qwen/../../data/qwen_mix",
+  "steps": 200,
+  "seqs": 32,
+  "micro": 4,
+  "warmup": 20,
+  "decay_frac": 0.2,
+  "alpha": 0.25,
+  "slow_horizon": 100,
+  "eval_every": 25,
+  "clip": 1.0,
+  "seed": 0,
+  "device": "cuda:0"
+ }
+}
